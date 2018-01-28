@@ -702,6 +702,7 @@ func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 }
 
 // CleanTombstones re-writes any blocks with tombstones.
+// It also clears tombstones from in-mem block (head).
 func (db *DB) CleanTombstones() error {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
@@ -723,6 +724,12 @@ func (db *DB) CleanTombstones() error {
 		if ok {
 			deleted = append(deleted, b.Dir())
 		}
+	}
+
+	// in-mem block
+	_, err := db.head.CleanTombstones()
+	if err != nil {
+		return errors.Wrapf(err, "clean tombstones: head")
 	}
 
 	if len(deleted) == 0 {

@@ -604,6 +604,67 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	return nil
 }
 
+// CleanTombstones re-writes the chunks with tombstones
+// and deletes chunks if there is no samples after removing tombstones 
+func (h *Head) CleanTombstones() (bool, error) {
+
+	modified := false // flag for entire block
+
+	for sid, dranges := range h.tombstones {
+		if len(dranges) == 0 {
+			continue
+		}
+
+		cleaned := false // flag for current tombstone
+		stripeSeriesIndex := sid%stripeSize
+
+		h.series.locks[stripeSeriesIndex].Lock()
+		s := h.series.series[stripeSeriesIndex] // series with tombstones
+
+		if ms, ok := s[sid]; ok {
+			for i, chk := range ms.chunks {
+				if !intervalOverlap(dranges[0].Mint, dranges[len(dranges)-1].Maxt, chk.minTime, chk.maxTime) {
+					continue
+				}
+
+				// create new chunk without deleted samples
+				newChunk := chunkenc.NewXORChunk()
+				app, err := newChunk.Appender()
+				if err != nil {
+					return modified, err
+				}
+
+				modified = true
+				cleaned = true
+
+				it := &deletedIterator{it: chk.chunk.Iterator(), intervals: dranges}
+				for it.Next() {
+					ts, v := it.At()
+					app.Append(ts, v)
+				}
+
+				if newChunk.NumSamples() > 0 {
+					ms.chunks[i].chunk = newChunk
+				} else {
+					ms.chunks = append(ms.chunks[:i], ms.chunks[i+1:]...)
+				}
+			}
+		}
+
+		h.series.locks[stripeSeriesIndex].Unlock()
+
+		if cleaned {
+			delete(h.tombstones, sid)
+		}
+	}
+
+	if modified {
+		h.gc()
+	}
+
+	return modified, nil
+}
+
 // gc removes data before the minimum timestamp from the head.
 func (h *Head) gc() {
 	// Only data strictly lower than this timestamp must be deleted.

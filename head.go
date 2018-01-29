@@ -601,6 +601,12 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	for _, s := range stones {
 		h.tombstones.add(s.ref, s.intervals[0])
 	}
+
+	_, err = h.CleanTombstones()
+	if err != nil {
+		return errors.Wrap(err, "Head: CleanTombstones in Delete")
+	}
+
 	return nil
 }
 

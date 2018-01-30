@@ -233,19 +233,6 @@ func TestMemSeries_truncateChunks(t *testing.T) {
 func TestHeadDeleteSimple(t *testing.T) {
 	numSamples := int64(10)
 
-	head, err := NewHead(nil, nil, nil, 1000)
-	testutil.Ok(t, err)
-	defer head.Close()
-
-	app := head.Appender()
-
-	smpls := make([]float64, numSamples)
-	for i := int64(0); i < numSamples; i++ {
-		smpls[i] = rand.Float64()
-		app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
-	}
-
-	testutil.Ok(t, app.Commit())
 	cases := []struct {
 		intervals Intervals
 		remaint   []int64
@@ -274,8 +261,21 @@ func TestHeadDeleteSimple(t *testing.T) {
 
 Outer:
 	for _, c := range cases {
-		// Reset the tombstones.
-		head.tombstones = memTombstones{}
+		// Samples are deleted from head after calling head.Delete()
+		// and not just creating tombstones
+		// Hence creating new Head for every case
+		head, err := NewHead(nil, nil, nil, 1000)
+		testutil.Ok(t, err)
+
+		app := head.Appender()
+
+		smpls := make([]float64, numSamples)
+		for i := int64(0); i < numSamples; i++ {
+			smpls[i] = rand.Float64()
+			app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
+		}
+
+		testutil.Ok(t, app.Commit())
 
 		// Delete the ranges.
 		for _, r := range c.intervals {
@@ -299,6 +299,7 @@ Outer:
 
 		if len(expSamples) == 0 {
 			testutil.Assert(t, res.Next() == false, "")
+			head.Close()
 			continue
 		}
 
@@ -307,6 +308,7 @@ Outer:
 			testutil.Equals(t, eok, rok)
 
 			if !eok {
+				head.Close()
 				continue Outer
 			}
 			sexp := expss.At()
@@ -320,6 +322,7 @@ Outer:
 			testutil.Equals(t, errExp, errRes)
 			testutil.Equals(t, smplExp, smplRes)
 		}
+		head.Close()
 	}
 }
 

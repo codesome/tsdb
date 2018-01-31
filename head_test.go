@@ -354,7 +354,7 @@ func TestHeadTombstoneClean(t *testing.T) {
 			remaint:   []int64{0},
 			remaSampbuf: []int64{0},
 		},
-		{
+		{ // This case is for checking if labels and symbols are deleted.
 			intervals: Intervals{{0, 9}},
 			remaint:   []int64{},
 			remaSampbuf: []int64{},
@@ -422,10 +422,12 @@ func TestHeadTombstoneClean(t *testing.T) {
 			expSampleBuf[i+rem] = sample{ts, smpls[ts]}
 		}
 
+		seriesExists := false
 		// Actual sampleBuf.
 		actSampleBuf := func () [4]sample {
 				for _, msmap := range head.series.series {
 					if len(msmap) > 0 {
+						seriesExists = true
 						for _, ms := range msmap {
 							return ms.sampleBuf
 						}
@@ -434,8 +436,13 @@ func TestHeadTombstoneClean(t *testing.T) {
 				return [4]sample{{0,0},{0,0},{0,0},{0,0}}
 			} ()
 
-
 		testutil.Equals(t, expSampleBuf, actSampleBuf)
+
+		if len(expSamples) == 0 {
+			testutil.Assert(t, len(head.values) == 0, "")
+			testutil.Assert(t, len(head.symbols) == 0, "")
+			testutil.Assert(t, !seriesExists, "")
+		}
 
 		testutil.Assert(t, head.Close() == nil, "")
 	}

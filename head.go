@@ -684,12 +684,12 @@ func (h *Head) CleanTombstones() (bool, error) {
 			}
 
 			// Updating sampleBuf
-			rem := 4 - len(last4)
-			for i := 0; i<rem; i++ { // got less than 4 samples
+			emptyLen := 4 - len(last4)
+			for i := 0; i<emptyLen; i++ { // got less than 4 samples
 				ms.sampleBuf[i] = sample{t: 0, v: 0}
 			}
 			for i, smpl := range last4 {
-				ms.sampleBuf[i+rem] = smpl
+				ms.sampleBuf[i+emptyLen] = smpl
 			}
 		}
 

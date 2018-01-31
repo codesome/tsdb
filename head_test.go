@@ -326,6 +326,121 @@ Outer:
 	}
 }
 
+func TestHeadTombstoneClean(t *testing.T) {
+	numSamples := int64(10)
+
+	cases := []struct {
+		intervals Intervals
+		remaint   []int64
+		remaSampbuf []int64
+	}{
+		{
+			intervals: Intervals{{0, 3}},
+			remaint:   []int64{4, 5, 6, 7, 8, 9},
+			remaSampbuf: []int64{6, 7, 8, 9},
+		},
+		{
+			intervals: Intervals{{1, 3}},
+			remaint:   []int64{0, 4, 5, 6, 7, 8, 9},
+			remaSampbuf: []int64{6, 7, 8, 9},
+		},
+		{
+			intervals: Intervals{{1, 3}, {4, 7}},
+			remaint:   []int64{0, 8, 9},
+			remaSampbuf: []int64{0, 8, 9},
+		},
+		{
+			intervals: Intervals{{1, 3}, {4, 700}},
+			remaint:   []int64{0},
+			remaSampbuf: []int64{0},
+		},
+		{
+			intervals: Intervals{{0, 9}},
+			remaint:   []int64{},
+			remaSampbuf: []int64{},
+		},
+	}
+
+	for _, c := range cases {
+		// Samples are deleted from head after calling head.CleanTombstones()
+		// Hence creating new Head for every case
+		head, err := NewHead(nil, nil, nil, 1000)
+		testutil.Ok(t, err)
+
+		app := head.Appender()
+
+		smpls := make([]float64, numSamples)
+		for i := int64(0); i < numSamples; i++ {
+			smpls[i] = rand.Float64()
+			app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
+		}
+
+		testutil.Ok(t, app.Commit())
+
+		// Delete the ranges. Delete calls CleanTombstones() at the end, hence no need
+		// to call here
+		for _, r := range c.intervals {
+			testutil.Ok(t, head.Delete(r.Mint, r.Maxt, labels.NewEqualMatcher("a", "b")))
+		}
+
+		/// Checking samples
+
+		// expected samples
+		expSamples := make([]sample, 0, len(c.remaint))
+		for _, ts := range c.remaint {
+			expSamples = append(expSamples, sample{ts, smpls[ts]})
+		}
+
+		// collect all samples from head
+		actSamples := make([]sample, 0, len(c.remaint))
+		for _, ss := range head.series.series {
+			for _, ms := range ss {
+				for _, chk := range ms.chunks {
+					ii := chk.chunk.Iterator()
+					for ii.Next() {
+						t, v := ii.At()
+						actSamples = append(actSamples, sample{t: t, v: v})
+					}
+				}
+			}
+		}
+
+		testutil.Equals(t, expSamples, actSamples)
+
+		/// Checking samples in sampleBuf
+		/// In this test, there is only 1 series, hence single sampleBuf
+		
+		// expected samples in sampleBuf
+		var expSampleBuf [4]sample
+		rem := 4-len(c.remaSampbuf)
+		// Buffer can have <4 samples
+		// remaining buffer should have {0, 0}
+		for i := 0; i < rem; i++ {
+			expSampleBuf[i] = sample{0,0}
+		}
+		for i, ts := range c.remaSampbuf {
+			expSampleBuf[i+rem] = sample{ts, smpls[ts]}
+		}
+
+		// actual sampleBuf
+		actSampleBuf := func () [4]sample {
+				for _, msmap := range head.series.series {
+					if len(msmap) > 0 {
+						for _, ms := range msmap {
+							return ms.sampleBuf
+						}
+					}
+				}
+				return [4]sample{{0,0},{0,0},{0,0},{0,0}}
+			} ()
+
+
+		testutil.Equals(t, expSampleBuf, actSampleBuf)
+
+		head.Close()
+	}
+}
+
 // func TestDeleteUntilCurMax(t *testing.T) {
 // 	numSamples := int64(10)
 

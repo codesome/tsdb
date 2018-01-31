@@ -611,30 +611,32 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 }
 
 // CleanTombstones re-writes the chunks with tombstones
-// and deletes chunks if there is no samples after removing tombstones 
+// and deletes chunks if there is no samples after removing tombstones.
 func (h *Head) CleanTombstones() (bool, error) {
 
-	modified := false // flag for entire block
+	modified := false // Flag for entire block.
 
 	for sid, dranges := range h.tombstones {
 		if len(dranges) == 0 {
 			continue
 		}
 
-		cleaned := false // flag for current tombstone
+		cleaned := false // Flag for current tombstone.
 		stripeSeriesIndex := sid%stripeSize
 
 		h.series.locks[stripeSeriesIndex].Lock()
-		s := h.series.series[stripeSeriesIndex] // series with tombstones
+		s := h.series.series[stripeSeriesIndex] // Series with tombstones.
 
 		if ms, ok := s[sid]; ok {
-			// Deleting samples for intervals in tombstones
+			// Deleting samples for intervals in tombstones.
+			var chnksToDel []int
+			ms.Lock()
 			for i, chk := range ms.chunks {
 				if !intervalOverlap(dranges[0].Mint, dranges[len(dranges)-1].Maxt, chk.minTime, chk.maxTime) {
 					continue
 				}
 
-				// create new chunk by removing deleted samples
+				// Create new chunk by removing deleted samples.
 				newChunk := chunkenc.NewXORChunk()
 				app, err := newChunk.Appender()
 				if err != nil {
@@ -652,52 +654,56 @@ func (h *Head) CleanTombstones() (bool, error) {
 
 				if newChunk.NumSamples() > 0 {
 					ms.chunks[i].chunk = newChunk
-				} else { // empty chunk, no required to store
-					ms.chunks = append(ms.chunks[:i], ms.chunks[i+1:]...)
+				} else { // Empty chunk, not required to store.
+					chnksToDel = append(chnksToDel, i)
+				}
+			}
+			// Deleting empty chunks.
+			for i, idx := range chnksToDel {
+				if len(ms.chunks) >= (idx-i)+2 {
+					ms.chunks = append(ms.chunks[:idx-i], ms.chunks[idx-i+1:]...)
+				} else {
+					ms.chunks = ms.chunks[:idx-i]
 				}
 			}
 
-			// Getting the last 4 samples in the series
-			// to update the sampleBuf
+			// Getting the last 4 samples in the last chunk
+			// to update the sampleBuf.
 			nchks := len(ms.chunks)
-			tofill := 4 // samples left to fill in buffer
-			last4 := []sample{} // last 4 samples
-			for i := nchks-1; i>=0 && tofill>0; i-- {
-	
-				it := ms.chunks[i].chunk.Iterator()
-				nsmpls := ms.chunks[i].chunk.NumSamples()
-
-				if nsmpls > 0 {
-					llast := []sample{} // local last few samples
-					for nsmpls > tofill { // iterating till last few samples
+			if nchks > 0 {
+				chk := ms.chunks[nchks-1].chunk
+				nsmpls := chk.NumSamples()
+				it := chk.Iterator()
+				i := 0
+				if nsmpls < 4 {
+					for ; i < (4-nsmpls); i++ { // Got less than 4 samples.
+						ms.sampleBuf[i] = sample{t: 0, v: 0}
+					}
+				} else {
+					for nsmpls > 4 { // Iterating till last few samples.
 						it.Next()
 						nsmpls--
 					}
-					for it.Next() {
-						tofill--
-						ts, v := it.At()
-						llast = append(llast, sample{t: ts, v: v})
-					}
-					last4 = append(llast, last4...)
 				}
+				for ; it.Next(); i++ {
+					ts, v := it.At()
+					ms.sampleBuf[i] = sample{t: ts, v: v}
+				}
+			} else {
+				for i := 0 ; i<4; i++ {
+					ms.sampleBuf[i] = sample{t: 0, v: 0}
+				}
+			}
+			ms.Unlock()
 
-			}
-
-			// Updating sampleBuf
-			emptyLen := 4 - len(last4)
-			for i := 0; i<emptyLen; i++ { // got less than 4 samples
-				ms.sampleBuf[i] = sample{t: 0, v: 0}
-			}
-			for i, smpl := range last4 {
-				ms.sampleBuf[i+emptyLen] = smpl
-			}
 		}
-
-		h.series.locks[stripeSeriesIndex].Unlock()
 
 		if cleaned {
 			delete(h.tombstones, sid)
 		}
+
+		h.series.locks[stripeSeriesIndex].Unlock()
+
 	}
 
 	if modified {

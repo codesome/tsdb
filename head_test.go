@@ -262,8 +262,8 @@ func TestHeadDeleteSimple(t *testing.T) {
 Outer:
 	for _, c := range cases {
 		// Samples are deleted from head after calling head.Delete()
-		// and not just creating tombstones
-		// Hence creating new Head for every case
+		// and not just creating tombstones.
+		// Hence creating new Head for every case.
 		head, err := NewHead(nil, nil, nil, 1000)
 		testutil.Ok(t, err)
 
@@ -299,7 +299,7 @@ Outer:
 
 		if len(expSamples) == 0 {
 			testutil.Assert(t, res.Next() == false, "")
-			head.Close()
+			testutil.Assert(t, head.Close() == nil, "")
 			continue
 		}
 
@@ -308,7 +308,7 @@ Outer:
 			testutil.Equals(t, eok, rok)
 
 			if !eok {
-				head.Close()
+				testutil.Assert(t, head.Close() == nil, "")
 				continue Outer
 			}
 			sexp := expss.At()
@@ -322,7 +322,7 @@ Outer:
 			testutil.Equals(t, errExp, errRes)
 			testutil.Equals(t, smplExp, smplRes)
 		}
-		head.Close()
+		testutil.Assert(t, head.Close() == nil, "")
 	}
 }
 
@@ -362,8 +362,8 @@ func TestHeadTombstoneClean(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		// Samples are deleted from head after calling head.CleanTombstones()
-		// Hence creating new Head for every case
+		// Samples are deleted from head after calling head.CleanTombstones().
+		// Hence creating new Head for every case.
 		head, err := NewHead(nil, nil, nil, 1000)
 		testutil.Ok(t, err)
 
@@ -378,20 +378,20 @@ func TestHeadTombstoneClean(t *testing.T) {
 		testutil.Ok(t, app.Commit())
 
 		// Delete the ranges. Delete calls CleanTombstones() at the end, hence no need
-		// to call here
+		// to call here.
 		for _, r := range c.intervals {
 			testutil.Ok(t, head.Delete(r.Mint, r.Maxt, labels.NewEqualMatcher("a", "b")))
 		}
 
-		/// Checking samples
+		/// Checking samples.
 
-		// expected samples
+		// Expected samples.
 		expSamples := make([]sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
 		}
 
-		// collect all samples from head
+		// Collect all samples from head.
 		actSamples := make([]sample, 0, len(c.remaint))
 		for _, ss := range head.series.series {
 			for _, ms := range ss {
@@ -407,14 +407,14 @@ func TestHeadTombstoneClean(t *testing.T) {
 
 		testutil.Equals(t, expSamples, actSamples)
 
-		/// Checking samples in sampleBuf
-		/// In this test, there is only 1 series, hence single sampleBuf
+		/// Checking samples in sampleBuf.
+		/// In this test, there is only 1 series, hence single sampleBuf.
 		
-		// expected samples in sampleBuf
+		// Expected samples in sampleBuf.
 		var expSampleBuf [4]sample
 		rem := 4-len(c.remaSampbuf)
-		// Buffer can have <4 samples
-		// remaining buffer should have {0, 0}
+		// Buffer can have <4 samples.
+		// Remaining buffer should have {0, 0}.
 		for i := 0; i < rem; i++ {
 			expSampleBuf[i] = sample{0,0}
 		}
@@ -422,7 +422,7 @@ func TestHeadTombstoneClean(t *testing.T) {
 			expSampleBuf[i+rem] = sample{ts, smpls[ts]}
 		}
 
-		// actual sampleBuf
+		// Actual sampleBuf.
 		actSampleBuf := func () [4]sample {
 				for _, msmap := range head.series.series {
 					if len(msmap) > 0 {
@@ -437,7 +437,7 @@ func TestHeadTombstoneClean(t *testing.T) {
 
 		testutil.Equals(t, expSampleBuf, actSampleBuf)
 
-		head.Close()
+		testutil.Assert(t, head.Close() == nil, "")
 	}
 }
 

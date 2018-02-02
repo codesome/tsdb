@@ -726,7 +726,7 @@ func (db *DB) CleanTombstones() error {
 		}
 	}
 
-	// in-mem block
+	// In-mem block.
 	_, err := db.head.CleanTombstones()
 	if err != nil {
 		return errors.Wrapf(err, "clean tombstones: head")

@@ -669,31 +669,22 @@ func (h *Head) CleanTombstones() (bool, error) {
 
 			// Getting the last 4 samples in the last chunk
 			// to update the sampleBuf.
-			nchks := len(ms.chunks)
-			if nchks > 0 {
-				chk := ms.chunks[nchks-1].chunk
+			var sb [4]sample
+			if len(ms.chunks) > 0 {
+				chk := ms.chunks[len(ms.chunks)-1].chunk
 				nsmpls := chk.NumSamples()
 				it := chk.Iterator()
-				i := 0
-				if nsmpls < 4 {
-					for ; i < (4-nsmpls); i++ { // Got less than 4 samples.
-						ms.sampleBuf[i] = sample{t: 0, v: 0}
-					}
-				} else {
-					for nsmpls > 4 { // Iterating till last few samples.
-						it.Next()
-						nsmpls--
-					}
+				for nsmpls > 4 { // Iterating till last 4 samples.
+					it.Next()
+					nsmpls--
 				}
-				for ; it.Next(); i++ {
+				for i := 4-nsmpls; it.Next(); i++ {
 					ts, v := it.At()
-					ms.sampleBuf[i] = sample{t: ts, v: v}
-				}
-			} else {
-				for i := 0 ; i<4; i++ {
-					ms.sampleBuf[i] = sample{t: 0, v: 0}
+					sb[i] = sample{t: ts, v: v}
 				}
 			}
+			ms.sampleBuf = sb
+
 			ms.Unlock()
 
 		}

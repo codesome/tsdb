@@ -69,7 +69,6 @@ type Head struct {
 
 	postings *index.MemPostings // postings lists for terms
 
-	tombstones memTombstones
 }
 
 type headMetrics struct {
@@ -189,7 +188,6 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal WAL, chunkRange int64) (
 		values:     map[string]stringset{},
 		symbols:    map[string]struct{}{},
 		postings:   index.NewUnorderedMemPostings(),
-		tombstones: memTombstones{},
 	}
 	h.metrics = newHeadMetrics(h, r)
 
@@ -297,10 +295,10 @@ func (h *Head) ReadWAL() error {
 	deletesFunc := func(stones []Stone) {
 		for _, s := range stones {
 			for _, itv := range s.intervals {
-				if itv.Maxt < mint {
-					continue
+				if itv.Maxt >= mint  {
+					h.delete(s)
+					break
 				}
-				h.tombstones.add(s.ref, itv)
 			}
 		}
 	}
@@ -394,7 +392,7 @@ func (h *rangeHead) Chunks() (ChunkReader, error) {
 }
 
 func (h *rangeHead) Tombstones() (TombstoneReader, error) {
-	return h.head.tombstones, nil
+	return EmptyTombstoneReader(), nil
 }
 
 // initAppender is a helper to initialize the time bounds of the head
@@ -582,14 +580,20 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 		return errors.Wrap(err, "select series")
 	}
 
+	dirty := false
 	var stones []Stone
-
 	for p.Next() {
 		series := h.series.getByID(p.At())
 
 		// Delete only until the current values and not beyond.
 		t0, t1 := clampInterval(mint, maxt, series.minTime(), series.maxTime())
-		stones = append(stones, Stone{p.At(), Intervals{{t0, t1}}})
+		s := Stone{p.At(), Intervals{{t0, t1}}}
+		stones = append(stones, s)
+
+		if err := h.delete(s); err != nil {
+			return err
+		}
+		dirty = true
 	}
 
 	if p.Err() != nil {
@@ -598,110 +602,87 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	if err := h.wal.LogDeletes(stones); err != nil {
 		return err
 	}
-	for _, s := range stones {
-		h.tombstones.add(s.ref, s.intervals[0])
-	}
-
-	_, err = h.CleanTombstones()
-	if err != nil {
-		return errors.Wrap(err, "Head: CleanTombstones in Delete")
+	if dirty {
+		h.gc()
 	}
 
 	return nil
 }
 
-// CleanTombstones re-writes the chunks with tombstones
+// delete re-writes the chunks with tombstones (deleted range)
 // and deletes chunks if there is no samples after removing tombstones.
-func (h *Head) CleanTombstones() (bool, error) {
+func (h *Head) delete(stone Stone) (error) {
 
-	modified := false // Flag for entire block.
+	sid := stone.ref
+	dranges := stone.intervals
 
-	for sid, dranges := range h.tombstones {
-		if len(dranges) == 0 {
+	if len(dranges) == 0 {
+		return nil
+	}
+
+	stripeSeriesIndex := sid%stripeSize
+
+	h.series.locks[stripeSeriesIndex].Lock()
+	ms, _ := h.series.series[stripeSeriesIndex][sid]
+	ms.Lock()
+	
+	// Deleting samples for intervals in tombstones.
+	var chnksToDel []int
+	for i, chk := range ms.chunks {
+		if !intervalOverlap(dranges[0].Mint, dranges[len(dranges)-1].Maxt, chk.minTime, chk.maxTime) {
 			continue
 		}
 
-		cleaned := false // Flag for current tombstone.
-		stripeSeriesIndex := sid%stripeSize
-
-		h.series.locks[stripeSeriesIndex].Lock()
-		s := h.series.series[stripeSeriesIndex] // Series with tombstones.
-
-		if ms, ok := s[sid]; ok {
-			// Deleting samples for intervals in tombstones.
-			var chnksToDel []int
-			ms.Lock()
-			for i, chk := range ms.chunks {
-				if !intervalOverlap(dranges[0].Mint, dranges[len(dranges)-1].Maxt, chk.minTime, chk.maxTime) {
-					continue
-				}
-
-				// Create new chunk by removing deleted samples.
-				newChunk := chunkenc.NewXORChunk()
-				app, err := newChunk.Appender()
-				if err != nil {
-					return modified, err
-				}
-
-				modified = true
-				cleaned = true
-
-				it := &deletedIterator{it: chk.chunk.Iterator(), intervals: dranges}
-				for it.Next() {
-					ts, v := it.At()
-					app.Append(ts, v)
-				}
-
-				if newChunk.NumSamples() > 0 {
-					ms.chunks[i].chunk = newChunk
-				} else { // Empty chunk, not required to store.
-					chnksToDel = append(chnksToDel, i)
-				}
-			}
-			// Deleting empty chunks.
-			for i, idx := range chnksToDel {
-				if len(ms.chunks) >= (idx-i)+2 {
-					ms.chunks = append(ms.chunks[:idx-i], ms.chunks[idx-i+1:]...)
-				} else {
-					ms.chunks = ms.chunks[:idx-i]
-				}
-			}
-
-			// Getting the last 4 samples in the last chunk
-			// to update the sampleBuf.
-			var sb [4]sample
-			if len(ms.chunks) > 0 {
-				chk := ms.chunks[len(ms.chunks)-1].chunk
-				nsmpls := chk.NumSamples()
-				it := chk.Iterator()
-				for nsmpls > 4 { // Iterating till last 4 samples.
-					it.Next()
-					nsmpls--
-				}
-				for i := 4-nsmpls; it.Next(); i++ {
-					ts, v := it.At()
-					sb[i] = sample{t: ts, v: v}
-				}
-			}
-			ms.sampleBuf = sb
-
-			ms.Unlock()
-
+		// Create new chunk by removing deleted samples.
+		newChunk := chunkenc.NewXORChunk()
+		app, err := newChunk.Appender()
+		if err != nil {
+			return err
 		}
 
-		if cleaned {
-			delete(h.tombstones, sid)
+		it := &deletedIterator{it: chk.chunk.Iterator(), intervals: dranges}
+		for it.Next() {
+			ts, v := it.At()
+			app.Append(ts, v)
 		}
 
-		h.series.locks[stripeSeriesIndex].Unlock()
-
+		if newChunk.NumSamples() > 0 {
+			ms.chunks[i].chunk = newChunk
+		} else { // Empty chunk, not required to store.
+			chnksToDel = append(chnksToDel, i)
+		}
+	}
+	// Deleting empty chunks.
+	for i, idx := range chnksToDel {
+		if len(ms.chunks) >= (idx-i)+2 {
+			ms.chunks = append(ms.chunks[:idx-i], ms.chunks[idx-i+1:]...)
+		} else {
+			ms.chunks = ms.chunks[:idx-i]
+		}
 	}
 
-	if modified {
-		h.gc()
+	// Getting the last 4 samples in the last chunk
+	// to update the sampleBuf.
+	var sb [4]sample
+	if len(ms.chunks) > 0 {
+		chk := ms.chunks[len(ms.chunks)-1].chunk
+		nsmpls := chk.NumSamples()
+		it := chk.Iterator()
+		for nsmpls > 4 { // Iterating till last 4 samples.
+			it.Next()
+			nsmpls--
+		}
+		for i := 4-nsmpls; it.Next(); i++ {
+			ts, v := it.At()
+			sb[i] = sample{t: ts, v: v}
+		}
 	}
+	ms.sampleBuf = sb
 
-	return modified, nil
+	ms.Unlock()
+	h.series.locks[stripeSeriesIndex].Unlock()
+
+	return nil
 }
 
 // gc removes data before the minimum timestamp from the head.
@@ -749,7 +730,7 @@ func (h *Head) gc() {
 
 // Tombstones returns a new reader over the head's tombstones
 func (h *Head) Tombstones() (TombstoneReader, error) {
-	return h.tombstones, nil
+	return EmptyTombstoneReader(), nil
 }
 
 // Index returns an IndexReader against the block.

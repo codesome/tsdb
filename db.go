@@ -726,12 +726,6 @@ func (db *DB) CleanTombstones() error {
 		}
 	}
 
-	// In-mem block.
-	_, err := db.head.CleanTombstones()
-	if err != nil {
-		return errors.Wrapf(err, "clean tombstones: head")
-	}
-
 	if len(deleted) == 0 {
 		return nil
 	}

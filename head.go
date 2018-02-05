@@ -654,11 +654,7 @@ func (h *Head) delete(stone Stone) (error) {
 	}
 	// Deleting empty chunks.
 	for i, idx := range chnksToDel {
-		if len(ms.chunks) >= (idx-i)+2 {
-			ms.chunks = append(ms.chunks[:idx-i], ms.chunks[idx-i+1:]...)
-		} else {
-			ms.chunks = ms.chunks[:idx-i]
-		}
+		ms.chunks = append(ms.chunks[:idx-i], ms.chunks[idx-i+1:]...)
 	}
 
 	// Getting the last 4 samples in the last chunk

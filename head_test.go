@@ -236,103 +236,7 @@ func TestHeadDeleteSimple(t *testing.T) {
 	cases := []struct {
 		intervals Intervals
 		remaint   []int64
-	}{
-		{
-			intervals: Intervals{{0, 3}},
-			remaint:   []int64{4, 5, 6, 7, 8, 9},
-		},
-		{
-			intervals: Intervals{{1, 3}},
-			remaint:   []int64{0, 4, 5, 6, 7, 8, 9},
-		},
-		{
-			intervals: Intervals{{1, 3}, {4, 7}},
-			remaint:   []int64{0, 8, 9},
-		},
-		{
-			intervals: Intervals{{1, 3}, {4, 700}},
-			remaint:   []int64{0},
-		},
-		{
-			intervals: Intervals{{0, 9}},
-			remaint:   []int64{},
-		},
-	}
-
-Outer:
-	for _, c := range cases {
-		// Samples are deleted from head after calling head.Delete()
-		// and not just creating tombstones.
-		// Hence creating new Head for every case.
-		head, err := NewHead(nil, nil, nil, 1000)
-		testutil.Ok(t, err)
-
-		app := head.Appender()
-
-		smpls := make([]float64, numSamples)
-		for i := int64(0); i < numSamples; i++ {
-			smpls[i] = rand.Float64()
-			app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
-		}
-
-		testutil.Ok(t, app.Commit())
-
-		// Delete the ranges.
-		for _, r := range c.intervals {
-			testutil.Ok(t, head.Delete(r.Mint, r.Maxt, labels.NewEqualMatcher("a", "b")))
-		}
-
-		// Compare the result.
-		q, err := NewBlockQuerier(head, head.MinTime(), head.MaxTime())
-		testutil.Ok(t, err)
-		res, err := q.Select(labels.NewEqualMatcher("a", "b"))
-		testutil.Ok(t, err)
-
-		expSamples := make([]sample, 0, len(c.remaint))
-		for _, ts := range c.remaint {
-			expSamples = append(expSamples, sample{ts, smpls[ts]})
-		}
-
-		expss := newListSeriesSet([]Series{
-			newSeries(map[string]string{"a": "b"}, expSamples),
-		})
-
-		if len(expSamples) == 0 {
-			testutil.Assert(t, res.Next() == false, "")
-			testutil.Assert(t, head.Close() == nil, "")
-			continue
-		}
-
-		for {
-			eok, rok := expss.Next(), res.Next()
-			testutil.Equals(t, eok, rok)
-
-			if !eok {
-				testutil.Assert(t, head.Close() == nil, "")
-				continue Outer
-			}
-			sexp := expss.At()
-			sres := res.At()
-
-			testutil.Equals(t, sexp.Labels(), sres.Labels())
-
-			smplExp, errExp := expandSeriesIterator(sexp.Iterator())
-			smplRes, errRes := expandSeriesIterator(sres.Iterator())
-
-			testutil.Equals(t, errExp, errRes)
-			testutil.Equals(t, smplExp, smplRes)
-		}
-		testutil.Assert(t, head.Close() == nil, "")
-	}
-}
-
-func TestHeadTombstoneClean(t *testing.T) {
-	numSamples := int64(10)
-
-	cases := []struct {
-		intervals Intervals
-		remaint   []int64
-		remaSampbuf []int64
+		remaSampbuf []int64 // sampleBuf after delete.
 	}{
 		{
 			intervals: Intervals{{0, 3}},
@@ -361,8 +265,10 @@ func TestHeadTombstoneClean(t *testing.T) {
 		},
 	}
 
+Outer:
 	for _, c := range cases {
-		// Samples are deleted from head after calling head.CleanTombstones().
+		// Samples are deleted from head after calling head.Delete()
+		// and not just creating tombstones.
 		// Hence creating new Head for every case.
 		head, err := NewHead(nil, nil, nil, 1000)
 		testutil.Ok(t, err)
@@ -377,14 +283,12 @@ func TestHeadTombstoneClean(t *testing.T) {
 
 		testutil.Ok(t, app.Commit())
 
-		// Delete the ranges. Delete calls CleanTombstones() at the end, hence no need
-		// to call here.
+		// Delete the ranges.
 		for _, r := range c.intervals {
 			testutil.Ok(t, head.Delete(r.Mint, r.Maxt, labels.NewEqualMatcher("a", "b")))
 		}
 
 		/// Checking samples.
-
 		// Expected samples.
 		expSamples := make([]sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
@@ -409,15 +313,10 @@ func TestHeadTombstoneClean(t *testing.T) {
 
 		/// Checking samples in sampleBuf.
 		/// In this test, there is only 1 series, hence single sampleBuf.
-		
+
 		// Expected samples in sampleBuf.
 		var expSampleBuf [4]sample
 		rem := 4-len(c.remaSampbuf)
-		// Buffer can have <4 samples.
-		// Remaining buffer should have {0, 0}.
-		for i := 0; i < rem; i++ {
-			expSampleBuf[i] = sample{0,0}
-		}
 		for i, ts := range c.remaSampbuf {
 			expSampleBuf[i+rem] = sample{ts, smpls[ts]}
 		}
@@ -439,12 +338,52 @@ func TestHeadTombstoneClean(t *testing.T) {
 		testutil.Equals(t, expSampleBuf, actSampleBuf)
 
 		if len(expSamples) == 0 {
-			testutil.Assert(t, len(head.values) == 0, "")
-			testutil.Assert(t, len(head.symbols) == 0, "")
+			testutil.Equals(t, len(head.values), 0)
+			testutil.Equals(t, len(head.symbols), 0)
 			testutil.Assert(t, !seriesExists, "")
 		}
 
-		testutil.Assert(t, head.Close() == nil, "")
+		// Compare the query result.
+		q, err := NewBlockQuerier(head, head.MinTime(), head.MaxTime())
+		testutil.Ok(t, err)
+		res, err := q.Select(labels.NewEqualMatcher("a", "b"))
+		testutil.Ok(t, err)
+
+		expSamples = nil
+		for _, ts := range c.remaint {
+			expSamples = append(expSamples, sample{ts, smpls[ts]})
+		}
+
+		expss := newListSeriesSet([]Series{
+			newSeries(map[string]string{"a": "b"}, expSamples),
+		})
+
+		if len(expSamples) == 0 {
+			testutil.Assert(t, !res.Next(), "")
+			testutil.Equals(t, head.Close(), nil)
+			continue
+		}
+
+		for {
+			eok, rok := expss.Next(), res.Next()
+			testutil.Equals(t, eok, rok)
+
+			if !eok {
+				testutil.Equals(t, head.Close(), nil)
+				continue Outer
+			}
+			sexp := expss.At()
+			sres := res.At()
+
+			testutil.Equals(t, sexp.Labels(), sres.Labels())
+
+			smplExp, errExp := expandSeriesIterator(sexp.Iterator())
+			smplRes, errRes := expandSeriesIterator(sres.Iterator())
+
+			testutil.Equals(t, errExp, errRes)
+			testutil.Equals(t, smplExp, smplRes)
+		}
+		testutil.Equals(t, head.Close(), nil)
 	}
 }
 

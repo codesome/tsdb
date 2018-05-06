@@ -63,9 +63,11 @@ type Head struct {
 	// All series addressable by their ID or hash.
 	series *stripeSeries
 
-	symMtx  sync.RWMutex
-	symbols map[string]struct{}
-	values  map[string]stringset // label names to possible values
+	symMtx                     sync.RWMutex
+	symbols                    map[string]struct{}
+	values                     map[string]stringset             // label names to possible values
+	compositeValues            map[string]*CompositeLabelValues // composite label names key to possible values
+	indexCompositeLabelNameSet labels.LabelNamesGroup
 
 	postings *index.MemPostings // postings lists for terms
 
@@ -169,7 +171,7 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 }
 
 // NewHead opens the head block in dir.
-func NewHead(r prometheus.Registerer, l log.Logger, wal WAL, chunkRange int64) (*Head, error) {
+func NewHead(r prometheus.Registerer, l log.Logger, wal WAL, chunkRange int64, indexCompositeLabelNameSet labels.LabelNamesGroup) (*Head, error) {
 	if l == nil {
 		l = log.NewNopLogger()
 	}
@@ -180,16 +182,18 @@ func NewHead(r prometheus.Registerer, l log.Logger, wal WAL, chunkRange int64) (
 		return nil, errors.Errorf("invalid chunk range %d", chunkRange)
 	}
 	h := &Head{
-		wal:        wal,
-		logger:     l,
-		chunkRange: chunkRange,
-		minTime:    math.MinInt64,
-		maxTime:    math.MinInt64,
-		series:     newStripeSeries(),
-		values:     map[string]stringset{},
-		symbols:    map[string]struct{}{},
-		postings:   index.NewUnorderedMemPostings(),
-		tombstones: memTombstones{},
+		wal:                        wal,
+		logger:                     l,
+		chunkRange:                 chunkRange,
+		minTime:                    math.MinInt64,
+		maxTime:                    math.MinInt64,
+		series:                     newStripeSeries(),
+		values:                     map[string]stringset{},
+		compositeValues:            map[string]*CompositeLabelValues{},
+		symbols:                    map[string]struct{}{},
+		postings:                   index.NewUnorderedMemPostings(),
+		tombstones:                 memTombstones{},
+		indexCompositeLabelNameSet: indexCompositeLabelNameSet,
 	}
 	h.metrics = newHeadMetrics(h, r)
 
@@ -905,6 +909,28 @@ func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSerie
 	h.symMtx.Lock()
 	defer h.symMtx.Unlock()
 
+	// get map for lset
+	// check with options and see if we have to index
+
+	var labelNames labels.LabelNames
+	for _, l := range lset {
+		labelNames.Add(l.Name)
+	}
+
+	toIndexLabelNames := h.indexCompositeLabelNameSet.SubsetMatches(labelNames)
+	for _, toIndex := range toIndexLabelNames {
+		if _, ok := h.compositeValues[toIndex.SortedKey()]; !ok {
+			h.compositeValues[toIndex.SortedKey()], _ = NewCompositeLabelValues(toIndex)
+		}
+		var values []string
+		for _, n := range toIndex.Names() {
+			values = append(values, lset.Get(n))
+		}
+		if !h.compositeValues[toIndex.SortedKey()].AddValue(values) {
+			// log error
+		}
+	}
+
 	for _, l := range lset {
 		valset, ok := h.values[l.Name]
 		if !ok {
@@ -1337,4 +1363,54 @@ func (ss stringset) slice() []string {
 	}
 	sort.Strings(slice)
 	return slice
+}
+
+type CompositeLabelValues struct {
+	labels labels.LabelNames
+	values [][]string
+}
+
+func NewCompositeLabelValues(labels labels.LabelNames, values ...[]string) (*CompositeLabelValues, error) {
+	for _, v := range values {
+		if labels.Len() != len(v) {
+			return nil, errors.New("Error in number of values")
+		}
+	}
+	return &CompositeLabelValues{
+		labels: labels,
+		values: values,
+	}, nil
+}
+
+func (clv *CompositeLabelValues) Labels() []string {
+	return append([]string{}, clv.labels.Names()...)
+}
+
+func (clv *CompositeLabelValues) valueExists(vals []string) bool {
+	for _, vSet := range clv.values {
+		exists := true
+		for i, v := range vSet {
+			if v != vals[i] {
+				exists = false
+				break
+			}
+		}
+
+		if exists {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (clv *CompositeLabelValues) AddValue(vals []string) bool {
+	if clv.labels.Len() != len(vals) {
+		return false
+	}
+
+	if !clv.valueExists(vals) {
+		clv.values = append(clv.values, vals)
+	}
+	return true
 }

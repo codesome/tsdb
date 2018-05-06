@@ -210,3 +210,155 @@ func ReadLabels(fn string, n int) ([]Labels, error) {
 	}
 	return mets, nil
 }
+
+// LabelNameKeyDelimiter is the Delimiter added between every Label Name in sorted key.
+const LabelNameKeyDelimiter = "#"
+
+// LabelNames is a sorted set of unique label names.
+type LabelNames struct {
+	names []string
+}
+
+// NewLabelNames returns a LabelNames for the strings given.
+func NewLabelNames(names ...string) LabelNames {
+	if len(names) == 0 {
+		return LabelNames{}
+	}
+	// Using a copy.
+	ln := append([]string{}, names...)
+	sort.Strings(ln)
+
+	filtered := []string{names[0]}
+	lastName := names[0]
+	for _, name := range names[1:] {
+		if lastName != name {
+			filtered = append(filtered, name)
+			lastName = name
+		}
+	}
+
+	return LabelNames{
+		names: filtered,
+	}
+}
+
+func (ln *LabelNames) Names() []string {
+	return ln.names
+}
+
+func (ln *LabelNames) Len() int {
+	return len(ln.names)
+}
+
+// Add adds a label name to the set.
+func (ln *LabelNames) Add(name string) {
+	if !ln.Contains(name) {
+		ln.names = append(ln.names, name)
+		// SortedKey may be requested multiple time,
+		// hence keep the names sorted always.
+		sort.Strings(ln.names)
+	}
+}
+
+// Contains returns true if the LabelNames contains the name.
+func (ln *LabelNames) Contains(name string) bool {
+	for _, n := range ln.names {
+		if name == n {
+			return true
+		}
+	}
+	return false
+}
+
+// Map returns a string map of the label names.
+func (ln *LabelNames) Map() map[string]struct{} {
+	result := make(map[string]struct{})
+	for _, n := range ln.names {
+		result[n] = struct{}{}
+	}
+	return result
+}
+
+// IsSubsetOf returns true if the names in ln is subset of superSet.
+func (ln *LabelNames) IsSubsetOf(superSet LabelNames) bool {
+	if len(ln.names) > len(superSet.names) {
+		return false
+	}
+
+	superSetMap := superSet.Map()
+
+	for _, n := range ln.names {
+		if _, ok := superSetMap[n]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// SortedKey gives a unique key for label name set.
+// Logic here is to concat all the names (sorted) with a delimiter.
+func (ln *LabelNames) SortedKey() string {
+	key := strings.Join(ln.names, LabelNameKeyDelimiter)
+	return key
+}
+
+// LabelNamesGroup is a group of multiple LabelNames set.
+// This group contains non duplicate label names.
+type LabelNamesGroup struct {
+	labelNames []LabelNames
+}
+
+// NewLabelNamesGroup returns a LabelNamesGroup from given LabelNames.
+func NewLabelNamesGroup(labelNames ...LabelNames) LabelNamesGroup {
+	lng := LabelNamesGroup{}
+	for _, ln := range labelNames {
+		lng.Add(ln)
+	}
+	return lng
+}
+
+// NewLabelNamesGroupFromStrings returns a LabelNamesGroup from given string slices.
+func NewLabelNamesGroupFromStrings(labelNamesStr ...[]string) LabelNamesGroup {
+	lng := LabelNamesGroup{}
+	for _, lns := range labelNamesStr {
+		lng.AddFromStrings(lns...)
+	}
+	return lng
+}
+
+// Contains returns true if the LabelNames set exists in the group.
+func (lng *LabelNamesGroup) Contains(ln LabelNames) bool {
+	for _, group := range lng.labelNames {
+		if group.SortedKey() == ln.SortedKey() {
+			return true
+		}
+	}
+	return false
+}
+
+// SubsetMatches returns the set of LabelNames which are subset of ln.
+func (lng *LabelNamesGroup) SubsetMatches(ln LabelNames) []LabelNames {
+	var result []LabelNames
+	for _, lns := range lng.labelNames {
+		if lns.IsSubsetOf(ln) {
+			result = append(result, lns)
+		}
+	}
+	return result
+}
+
+// Add adds a new LabelNames set to the group.
+func (lng *LabelNamesGroup) Add(ln LabelNames) {
+	if !lng.Contains(ln) {
+		lng.labelNames = append(lng.labelNames, ln)
+	}
+}
+
+// AddFromStrings adds a new LabelNames set to the group from string slice.
+func (lng *LabelNamesGroup) AddFromStrings(names ...string) {
+	ln := NewLabelNames(names...)
+	if !lng.Contains(ln) {
+		lng.labelNames = append(lng.labelNames, ln)
+	}
+}

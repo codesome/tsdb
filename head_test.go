@@ -14,6 +14,7 @@
 package tsdb
 
 import (
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -28,7 +29,7 @@ func BenchmarkCreateSeries(b *testing.B) {
 	lbls, err := labels.ReadLabels("testdata/all.series", b.N)
 	testutil.Ok(b, err)
 
-	h, err := NewHead(nil, nil, nil, 10000)
+	h, err := NewHead(nil, nil, nil, 10000, labels.LabelNamesGroup{})
 	if err != nil {
 		testutil.Ok(b, err)
 	}
@@ -87,7 +88,7 @@ func TestHead_ReadWAL(t *testing.T) {
 	}
 	wal := &memoryWAL{entries: entries}
 
-	head, err := NewHead(nil, nil, wal, 1000)
+	head, err := NewHead(nil, nil, wal, 1000, labels.LabelNamesGroup{})
 	testutil.Ok(t, err)
 	defer head.Close()
 
@@ -120,7 +121,7 @@ func TestHead_ReadWAL(t *testing.T) {
 }
 
 func TestHead_Truncate(t *testing.T) {
-	h, err := NewHead(nil, nil, nil, 1000)
+	h, err := NewHead(nil, nil, nil, 1000, labels.LabelNamesGroup{})
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -246,7 +247,7 @@ func TestHeadDeleteSeriesWithoutSamples(t *testing.T) {
 	}
 	wal := &memoryWAL{entries: entries}
 
-	head, err := NewHead(nil, nil, wal, 1000)
+	head, err := NewHead(nil, nil, wal, 1000, labels.LabelNamesGroup{})
 	testutil.Ok(t, err)
 	defer head.Close()
 
@@ -258,7 +259,7 @@ func TestHeadDeleteSeriesWithoutSamples(t *testing.T) {
 func TestHeadDeleteSimple(t *testing.T) {
 	numSamples := int64(10)
 
-	head, err := NewHead(nil, nil, nil, 1000)
+	head, err := NewHead(nil, nil, nil, 1000, labels.LabelNamesGroup{})
 	testutil.Ok(t, err)
 	defer head.Close()
 
@@ -690,7 +691,7 @@ func TestMemSeries_append(t *testing.T) {
 
 func TestGCChunkAccess(t *testing.T) {
 	// Put a chunk, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, NopWAL(), 1000)
+	h, err := NewHead(nil, nil, NopWAL(), 1000, labels.LabelNamesGroup{})
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -730,7 +731,7 @@ func TestGCChunkAccess(t *testing.T) {
 
 func TestGCSeriesAccess(t *testing.T) {
 	// Put a series, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, NopWAL(), 1000)
+	h, err := NewHead(nil, nil, NopWAL(), 1000, labels.LabelNamesGroup{})
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -768,4 +769,65 @@ func TestGCSeriesAccess(t *testing.T) {
 	testutil.Equals(t, ErrNotFound, err)
 	_, err = cr.Chunk(chunks[1].Ref)
 	testutil.Equals(t, ErrNotFound, err)
+}
+
+func TestCompositeLabelIndex(t *testing.T) {
+
+	labelNamesSet := []labels.LabelNames{
+		labels.NewLabelNames("a", "b", "c"),
+		labels.NewLabelNames("b"),
+		labels.NewLabelNames("a", "c"),
+	}
+	lng := labels.NewLabelNamesGroup(labelNamesSet...)
+
+	h, err := NewHead(nil, nil, NopWAL(), 1000, lng)
+	testutil.Ok(t, err)
+	defer h.Close()
+
+	test := struct {
+		input   [][]string
+		results []struct {
+			labelNames labels.LabelNames
+			values     [][]string
+		}
+	}{
+		input: [][]string{
+			{"a", "1", "b", "2", "c", "3"},
+			{"b", "4"},
+			{"a", "5", "c", "6"},
+		},
+
+		results: []struct {
+			labelNames labels.LabelNames
+			values     [][]string
+		}{
+			{
+				labelNames: labelNamesSet[0],
+				values:     [][]string{{"1", "2", "3"}},
+			},
+			{
+				labelNames: labelNamesSet[1],
+				values:     [][]string{{"2"}, {"4"}},
+			},
+			{
+				labelNames: labelNamesSet[2],
+				values:     [][]string{{"1", "3"}, {"5", "6"}},
+			},
+		},
+	}
+
+	for i, stc := range test.input {
+		_, _ = h.getOrCreate(uint64(i+1), labels.FromStrings(stc...))
+	}
+
+	for _, tst := range test.results {
+		expClv, err := NewCompositeLabelValues(tst.labelNames, tst.values...)
+		testutil.Ok(t, err)
+		fmt.Println(tst.labelNames.SortedKey())
+		gotClv, ok := h.compositeValues[tst.labelNames.SortedKey()]
+		testutil.Assert(t, ok, "")
+		testutil.Equals(t, *expClv, *gotClv)
+
+	}
+
 }

@@ -63,6 +63,10 @@ type Options struct {
 
 	// NoLockfile disables creation and consideration of a lock file.
 	NoLockfile bool
+
+	// IndexCompositeLabelNameSet is the set of Label names on which
+	// composite label-value indices has to be maintained.
+	IndexCompositeLabelNameSet labels.LabelNamesGroup
 }
 
 // Appender allows appending a batch of data. It must be completed with a
@@ -229,7 +233,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 	if err != nil {
 		return nil, err
 	}
-	db.head, err = NewHead(r, l, wal, opts.BlockRanges[0])
+	db.head, err = NewHead(r, l, wal, opts.BlockRanges[0], db.opts.IndexCompositeLabelNameSet)
 	if err != nil {
 		return nil, err
 	}

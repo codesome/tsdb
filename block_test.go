@@ -23,11 +23,27 @@ import (
 	"github.com/prometheus/tsdb/testutil"
 )
 
-func TestSetCompactionFailed(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "test-tsdb")
+// In Prometheus 2.1.0 we had a bug where the meta.json version was falsely bumped
+// to 2. We had a migration in place resetting it to 1 but we should move immediately to
+// version 3 next time to avoid confusion and issues.
+func TestBlockMetaMustNeverBeVersion2(t *testing.T) {
+	dir, err := ioutil.TempDir("", "metaversion")
 	testutil.Ok(t, err)
+	defer os.RemoveAll(dir)
 
-	b := createEmptyBlock(t, tmpdir)
+	testutil.Ok(t, writeMetaFile(dir, &BlockMeta{}))
+
+	meta, err := readMetaFile(dir)
+	testutil.Ok(t, err)
+	testutil.Assert(t, meta.Version != 2, "meta.json version must never be 2")
+}
+
+func TestSetCompactionFailed(t *testing.T) {
+	tmpdir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	defer os.RemoveAll(tmpdir)
+
+	b := createEmptyBlock(t, tmpdir, &BlockMeta{Version: 2})
 
 	testutil.Equals(t, false, b.meta.Compaction.Failed)
 	testutil.Ok(t, b.setCompactionFailed())
@@ -39,10 +55,11 @@ func TestSetCompactionFailed(t *testing.T) {
 	testutil.Equals(t, true, b.meta.Compaction.Failed)
 }
 
-func createEmptyBlock(t *testing.T, dir string) *Block {
+// createEmpty block creates a block with the given meta but without any data.
+func createEmptyBlock(t *testing.T, dir string, meta *BlockMeta) *Block {
 	testutil.Ok(t, os.MkdirAll(dir, 0777))
 
-	testutil.Ok(t, writeMetaFile(dir, &BlockMeta{Version: 2}))
+	testutil.Ok(t, writeMetaFile(dir, meta))
 
 	ir, err := index.NewWriter(filepath.Join(dir, indexFilename))
 	testutil.Ok(t, err)
@@ -50,7 +67,7 @@ func createEmptyBlock(t *testing.T, dir string) *Block {
 
 	testutil.Ok(t, os.MkdirAll(chunkDir(dir), 0777))
 
-	testutil.Ok(t, writeTombstoneFile(dir, EmptyTombstoneReader()))
+	testutil.Ok(t, writeTombstoneFile(dir, NewMemTombstones()))
 
 	b, err := OpenBlock(dir, nil)
 	testutil.Ok(t, err)

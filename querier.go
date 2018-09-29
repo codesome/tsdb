@@ -117,7 +117,7 @@ func (q *querier) Close() error {
 	return merr.Err()
 }
 
-// NewBlockQuerier returns a queries against the readers.
+// NewBlockQuerier returns a querier against the reader.
 func NewBlockQuerier(b BlockReader, mint, maxt int64) (Querier, error) {
 	indexr, err := b.Index()
 	if err != nil {
@@ -478,7 +478,7 @@ type baseChunkSeries struct {
 // over them. It drops chunks based on tombstones in the given reader.
 func LookupChunkSeries(ir IndexReader, tr TombstoneReader, ms ...labels.Matcher) (ChunkSeriesSet, error) {
 	if tr == nil {
-		tr = EmptyTombstoneReader()
+		tr = NewMemTombstones()
 	}
 	p, err := PostingsForMatchers(ir, ms...)
 	if err != nil {
@@ -890,30 +890,6 @@ Outer:
 
 func (it *deletedIterator) Err() error {
 	return it.it.Err()
-}
-
-type mockSeriesSet struct {
-	next   func() bool
-	series func() Series
-	err    func() error
-}
-
-func (m *mockSeriesSet) Next() bool { return m.next() }
-func (m *mockSeriesSet) At() Series { return m.series() }
-func (m *mockSeriesSet) Err() error { return m.err() }
-
-func newListSeriesSet(list []Series) *mockSeriesSet {
-	i := -1
-	return &mockSeriesSet{
-		next: func() bool {
-			i++
-			return i < len(list)
-		},
-		series: func() Series {
-			return list[i]
-		},
-		err: func() error { return nil },
-	}
 }
 
 type errSeriesSet struct {

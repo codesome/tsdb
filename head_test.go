@@ -14,7 +14,10 @@
 package tsdb
 
 import (
+	"io/ioutil"
 	"math/rand"
+	"os"
+	"sort"
 	"testing"
 
 	"github.com/prometheus/tsdb/chunkenc"
@@ -22,16 +25,15 @@ import (
 	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 	"github.com/prometheus/tsdb/testutil"
+	"github.com/prometheus/tsdb/wal"
 )
 
 func BenchmarkCreateSeries(b *testing.B) {
-	lbls, err := labels.ReadLabels("testdata/all.series", b.N)
+	lbls, err := labels.ReadLabels("testdata/20kseries.json", b.N)
 	testutil.Ok(b, err)
 
 	h, err := NewHead(nil, nil, nil, 10000)
-	if err != nil {
-		testutil.Ok(b, err)
-	}
+	testutil.Ok(b, err)
 	defer h.Close()
 
 	b.ReportAllocs()
@@ -42,27 +44,50 @@ func BenchmarkCreateSeries(b *testing.B) {
 	}
 }
 
-type memoryWAL struct {
-	nopWAL
-	entries []interface{}
-}
-
-func (w *memoryWAL) Reader() WALReader {
-	return w
-}
-
-func (w *memoryWAL) Read(series func([]RefSeries), samples func([]RefSample), deletes func([]Stone)) error {
-	for _, e := range w.entries {
-		switch v := e.(type) {
+func populateTestWAL(t testing.TB, w *wal.WAL, recs []interface{}) {
+	var enc RecordEncoder
+	for _, r := range recs {
+		switch v := r.(type) {
 		case []RefSeries:
-			series(v)
+			testutil.Ok(t, w.Log(enc.Series(v, nil)))
 		case []RefSample:
-			samples(v)
+			testutil.Ok(t, w.Log(enc.Samples(v, nil)))
 		case []Stone:
-			deletes(v)
+			testutil.Ok(t, w.Log(enc.Tombstones(v, nil)))
 		}
 	}
-	return nil
+}
+
+func readTestWAL(t testing.TB, dir string) (recs []interface{}) {
+	sr, err := wal.NewSegmentsReader(dir)
+	testutil.Ok(t, err)
+	defer sr.Close()
+
+	var dec RecordDecoder
+	r := wal.NewReader(sr)
+
+	for r.Next() {
+		rec := r.Record()
+
+		switch dec.Type(rec) {
+		case RecordSeries:
+			series, err := dec.Series(rec, nil)
+			testutil.Ok(t, err)
+			recs = append(recs, series)
+		case RecordSamples:
+			samples, err := dec.Samples(rec, nil)
+			testutil.Ok(t, err)
+			recs = append(recs, samples)
+		case RecordTombstones:
+			tstones, err := dec.Tombstones(rec, nil)
+			testutil.Ok(t, err)
+			recs = append(recs, tstones)
+		default:
+			t.Fatalf("unknown record type")
+		}
+	}
+	testutil.Ok(t, r.Err())
+	return recs
 }
 
 func TestHead_ReadWAL(t *testing.T) {
@@ -85,13 +110,19 @@ func TestHead_ReadWAL(t *testing.T) {
 			{Ref: 50, T: 101, V: 6},
 		},
 	}
-	wal := &memoryWAL{entries: entries}
+	dir, err := ioutil.TempDir("", "test_read_wal")
+	testutil.Ok(t, err)
+	defer os.RemoveAll(dir)
 
-	head, err := NewHead(nil, nil, wal, 1000)
+	w, err := wal.New(nil, nil, dir)
+	testutil.Ok(t, err)
+	populateTestWAL(t, w, entries)
+
+	head, err := NewHead(nil, nil, w, 1000)
 	testutil.Ok(t, err)
 	defer head.Close()
 
-	testutil.Ok(t, head.ReadWAL())
+	testutil.Ok(t, head.Init())
 	testutil.Equals(t, uint64(100), head.lastSeriesID)
 
 	s10 := head.series.getByID(10)
@@ -179,17 +210,17 @@ func TestHead_Truncate(t *testing.T) {
 	testutil.Assert(t, postingsC1 == nil, "")
 
 	testutil.Equals(t, map[string]struct{}{
-		"":  struct{}{}, // from 'all' postings list
-		"a": struct{}{},
-		"b": struct{}{},
-		"1": struct{}{},
-		"2": struct{}{},
+		"":  {}, // from 'all' postings list
+		"a": {},
+		"b": {},
+		"1": {},
+		"2": {},
 	}, h.symbols)
 
 	testutil.Equals(t, map[string]stringset{
-		"a": stringset{"1": struct{}{}, "2": struct{}{}},
-		"b": stringset{"1": struct{}{}},
-		"":  stringset{"": struct{}{}},
+		"a": {"1": struct{}{}, "2": struct{}{}},
+		"b": {"1": struct{}{}},
+		"":  {"": struct{}{}},
 	}, h.values)
 }
 
@@ -230,37 +261,68 @@ func TestMemSeries_truncateChunks(t *testing.T) {
 	testutil.Assert(t, ok == false, "non-last chunk incorrectly wrapped with sample buffer")
 }
 
+func TestHeadDeleteSeriesWithoutSamples(t *testing.T) {
+	entries := []interface{}{
+		[]RefSeries{
+			{Ref: 10, Labels: labels.FromStrings("a", "1")},
+		},
+		[]RefSample{},
+		[]RefSeries{
+			{Ref: 50, Labels: labels.FromStrings("a", "2")},
+		},
+		[]RefSample{
+			{Ref: 50, T: 80, V: 1},
+			{Ref: 50, T: 90, V: 1},
+		},
+	}
+	dir, err := ioutil.TempDir("", "test_delete_series")
+	testutil.Ok(t, err)
+	defer os.RemoveAll(dir)
+
+	w, err := wal.New(nil, nil, dir)
+	testutil.Ok(t, err)
+	populateTestWAL(t, w, entries)
+
+	head, err := NewHead(nil, nil, w, 1000)
+	testutil.Ok(t, err)
+	defer head.Close()
+
+	testutil.Ok(t, head.Init())
+
+	testutil.Ok(t, head.Delete(0, 100, labels.NewEqualMatcher("a", "1")))
+}
+
 func TestHeadDeleteSimple(t *testing.T) {
 	numSamples := int64(10)
 
 	cases := []struct {
-		intervals Intervals
-		remaint   []int64
+		intervals   Intervals
+		remaint     []int64
 		remaSampbuf []int64 // sampleBuf after delete.
 	}{
 		{
-			intervals: Intervals{{0, 3}},
-			remaint:   []int64{4, 5, 6, 7, 8, 9},
+			intervals:   Intervals{{0, 3}},
+			remaint:     []int64{4, 5, 6, 7, 8, 9},
 			remaSampbuf: []int64{6, 7, 8, 9},
 		},
 		{
-			intervals: Intervals{{1, 3}},
-			remaint:   []int64{0, 4, 5, 6, 7, 8, 9},
+			intervals:   Intervals{{1, 3}},
+			remaint:     []int64{0, 4, 5, 6, 7, 8, 9},
 			remaSampbuf: []int64{6, 7, 8, 9},
 		},
 		{
-			intervals: Intervals{{1, 3}, {4, 7}},
-			remaint:   []int64{0, 8, 9},
+			intervals:   Intervals{{1, 3}, {4, 7}},
+			remaint:     []int64{0, 8, 9},
 			remaSampbuf: []int64{0, 8, 9},
 		},
 		{
-			intervals: Intervals{{1, 3}, {4, 700}},
-			remaint:   []int64{0},
+			intervals:   Intervals{{1, 3}, {4, 700}},
+			remaint:     []int64{0},
 			remaSampbuf: []int64{0},
 		},
 		{ // This case is for checking if labels and symbols are deleted.
-			intervals: Intervals{{0, 9}},
-			remaint:   []int64{},
+			intervals:   Intervals{{0, 9}},
+			remaint:     []int64{},
 			remaSampbuf: []int64{},
 		},
 	}
@@ -274,13 +336,11 @@ Outer:
 		testutil.Ok(t, err)
 
 		app := head.Appender()
-
 		smpls := make([]float64, numSamples)
 		for i := int64(0); i < numSamples; i++ {
 			smpls[i] = rand.Float64()
 			app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
 		}
-
 		testutil.Ok(t, app.Commit())
 
 		// Delete the ranges.
@@ -316,30 +376,30 @@ Outer:
 
 		// Expected samples in sampleBuf.
 		var expSampleBuf [4]sample
-		rem := 4-len(c.remaSampbuf)
+		rem := 4 - len(c.remaSampbuf)
 		for i, ts := range c.remaSampbuf {
 			expSampleBuf[i+rem] = sample{ts, smpls[ts]}
 		}
 
 		seriesExists := false
 		// Actual sampleBuf.
-		actSampleBuf := func () [4]sample {
-				for _, msmap := range head.series.series {
-					if len(msmap) > 0 {
-						seriesExists = true
-						for _, ms := range msmap {
-							return ms.sampleBuf
-						}
+		actSampleBuf := func() [4]sample {
+			for _, msmap := range head.series.series {
+				if len(msmap) > 0 {
+					seriesExists = true
+					for _, ms := range msmap {
+						return ms.sampleBuf
 					}
 				}
-				return [4]sample{{0,0},{0,0},{0,0},{0,0}}
-			} ()
+			}
+			return [4]sample{{0, 0}, {0, 0}, {0, 0}, {0, 0}}
+		}()
 
 		testutil.Equals(t, expSampleBuf, actSampleBuf)
 
 		if len(expSamples) == 0 {
-			testutil.Equals(t, len(head.values), 0)
-			testutil.Equals(t, len(head.symbols), 0)
+			testutil.Equals(t, 0, len(head.values))
+			testutil.Equals(t, 0, len(head.symbols))
 			testutil.Assert(t, !seriesExists, "")
 		}
 
@@ -354,13 +414,13 @@ Outer:
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
 		}
 
-		expss := newListSeriesSet([]Series{
+		expss := newMockSeriesSet([]Series{
 			newSeries(map[string]string{"a": "b"}, expSamples),
 		})
 
 		if len(expSamples) == 0 {
 			testutil.Assert(t, !res.Next(), "")
-			testutil.Equals(t, head.Close(), nil)
+			testutil.Ok(t, head.Close())
 			continue
 		}
 
@@ -369,7 +429,7 @@ Outer:
 			testutil.Equals(t, eok, rok)
 
 			if !eok {
-				testutil.Equals(t, head.Close(), nil)
+				testutil.Ok(t, head.Close())
 				continue Outer
 			}
 			sexp := expss.At()
@@ -383,235 +443,205 @@ Outer:
 			testutil.Equals(t, errExp, errRes)
 			testutil.Equals(t, smplExp, smplRes)
 		}
-		testutil.Equals(t, head.Close(), nil)
 	}
 }
 
-// func TestDeleteUntilCurMax(t *testing.T) {
-// 	numSamples := int64(10)
+func TestDeleteUntilCurMax(t *testing.T) {
+	numSamples := int64(10)
+	hb, err := NewHead(nil, nil, nil, 1000000)
+	testutil.Ok(t, err)
+	app := hb.Appender()
+	smpls := make([]float64, numSamples)
+	for i := int64(0); i < numSamples; i++ {
+		smpls[i] = rand.Float64()
+		_, err := app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
+		testutil.Ok(t, err)
+	}
+	testutil.Ok(t, app.Commit())
+	testutil.Ok(t, hb.Delete(0, 10000, labels.NewEqualMatcher("a", "b")))
 
-// 	dir, _ := ioutil.TempDir("", "test")
-// 	defer os.RemoveAll(dir)
+	// Test the series have been deleted.
+	q, err := NewBlockQuerier(hb, 0, 100000)
+	testutil.Ok(t, err)
+	res, err := q.Select(labels.NewEqualMatcher("a", "b"))
+	testutil.Ok(t, err)
+	testutil.Assert(t, !res.Next(), "series didn't get deleted")
 
-// 	hb := createTestHead(t, dir, 0, 2*numSamples)
-// 	app := hb.Appender()
-
-// 	smpls := make([]float64, numSamples)
-// 	for i := int64(0); i < numSamples; i++ {
-// 		smpls[i] = rand.Float64()
-// 		app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
-// 	}
-
-// 	testutil.Ok(t, app.Commit())
-// 	testutil.Ok(t, hb.Delete(0, 10000, labels.NewEqualMatcher("a", "b")))
-// 	app = hb.Appender()
-// 	_, err := app.Add(labels.Labels{{"a", "b"}}, 11, 1)
-// 	testutil.Ok(t, err)
-// 	testutil.Ok(t, app.Commit())
-
-// 	q := hb.Querier(0, 100000)
-// 	res := q.Select(labels.NewEqualMatcher("a", "b"))
-
-// 	require.True(t, res.Next())
-// 	exps := res.At()
-// 	it := exps.Iterator()
-// 	ressmpls, err := expandSeriesIterator(it)
-// 	testutil.Ok(t, err)
-// 	testutil.Equals(t, []sample{{11, 1}}, ressmpls)
-// }
-
-// func TestDelete_e2e(t *testing.T) {
-// 	numDatapoints := 1000
-// 	numRanges := 1000
-// 	timeInterval := int64(2)
-// 	maxTime := int64(2 * 1000)
-// 	minTime := int64(200)
-// 	// Create 8 series with 1000 data-points of different ranges, delete and run queries.
-// 	lbls := [][]labels.Label{
-// 		{
-// 			{"a", "b"},
-// 			{"instance", "localhost:9090"},
-// 			{"job", "prometheus"},
-// 		},
-// 		{
-// 			{"a", "b"},
-// 			{"instance", "127.0.0.1:9090"},
-// 			{"job", "prometheus"},
-// 		},
-// 		{
-// 			{"a", "b"},
-// 			{"instance", "127.0.0.1:9090"},
-// 			{"job", "prom-k8s"},
-// 		},
-// 		{
-// 			{"a", "b"},
-// 			{"instance", "localhost:9090"},
-// 			{"job", "prom-k8s"},
-// 		},
-// 		{
-// 			{"a", "c"},
-// 			{"instance", "localhost:9090"},
-// 			{"job", "prometheus"},
-// 		},
-// 		{
-// 			{"a", "c"},
-// 			{"instance", "127.0.0.1:9090"},
-// 			{"job", "prometheus"},
-// 		},
-// 		{
-// 			{"a", "c"},
-// 			{"instance", "127.0.0.1:9090"},
-// 			{"job", "prom-k8s"},
-// 		},
-// 		{
-// 			{"a", "c"},
-// 			{"instance", "localhost:9090"},
-// 			{"job", "prom-k8s"},
-// 		},
-// 	}
-
-// 	seriesMap := map[string][]sample{}
-// 	for _, l := range lbls {
-// 		seriesMap[labels.New(l...).String()] = []sample{}
-// 	}
-
-// 	dir, _ := ioutil.TempDir("", "test")
-// 	defer os.RemoveAll(dir)
-
-// 	hb := createTestHead(t, dir, minTime, maxTime)
-// 	app := hb.Appender()
-
-// 	for _, l := range lbls {
-// 		ls := labels.New(l...)
-// 		series := []sample{}
-
-// 		ts := rand.Int63n(300)
-// 		for i := 0; i < numDatapoints; i++ {
-// 			v := rand.Float64()
-// 			if ts >= minTime && ts <= maxTime {
-// 				series = append(series, sample{ts, v})
-// 			}
-
-// 			_, err := app.Add(ls, ts, v)
-// 			if ts >= minTime && ts <= maxTime {
-// 				testutil.Ok(t, err)
-// 			} else {
-// 				testutil.EqualsError(t, err, ErrOutOfBounds.Error())
-// 			}
-
-// 			ts += rand.Int63n(timeInterval) + 1
-// 		}
-
-// 		seriesMap[labels.New(l...).String()] = series
-// 	}
-
-// 	testutil.Ok(t, app.Commit())
-
-// 	// Delete a time-range from each-selector.
-// 	dels := []struct {
-// 		ms     []labels.Matcher
-// 		drange Intervals
-// 	}{
-// 		{
-// 			ms:     []labels.Matcher{labels.NewEqualMatcher("a", "b")},
-// 			drange: Intervals{{300, 500}, {600, 670}},
-// 		},
-// 		{
-// 			ms: []labels.Matcher{
-// 				labels.NewEqualMatcher("a", "b"),
-// 				labels.NewEqualMatcher("job", "prom-k8s"),
-// 			},
-// 			drange: Intervals{{300, 500}, {100, 670}},
-// 		},
-// 		{
-// 			ms: []labels.Matcher{
-// 				labels.NewEqualMatcher("a", "c"),
-// 				labels.NewEqualMatcher("instance", "localhost:9090"),
-// 				labels.NewEqualMatcher("job", "prometheus"),
-// 			},
-// 			drange: Intervals{{300, 400}, {100, 6700}},
-// 		},
-// 		// TODO: Add Regexp Matchers.
-// 	}
-
-// 	for _, del := range dels {
-// 		// Reset the deletes everytime.
-// 		writeTombstoneFile(hb.dir, newEmptyTombstoneReader())
-// 		hb.tombstones = newEmptyTombstoneReader()
-
-// 		for _, r := range del.drange {
-// 			testutil.Ok(t, hb.Delete(r.Mint, r.Maxt, del.ms...))
-// 		}
-
-// 		matched := labels.Slice{}
-// 		for _, ls := range lbls {
-// 			s := labels.Selector(del.ms)
-// 			if s.Matches(ls) {
-// 				matched = append(matched, ls)
-// 			}
-// 		}
-
-// 		sort.Sort(matched)
-
-// 		for i := 0; i < numRanges; i++ {
-// 			mint := rand.Int63n(200)
-// 			maxt := mint + rand.Int63n(timeInterval*int64(numDatapoints))
-
-// 			q := hb.Querier(mint, maxt)
-// 			ss := q.Select(del.ms...)
-
-// 			// Build the mockSeriesSet.
-// 			matchedSeries := make([]Series, 0, len(matched))
-// 			for _, m := range matched {
-// 				smpls := boundedSamples(seriesMap[m.String()], mint, maxt)
-// 				smpls = deletedSamples(smpls, del.drange)
-
-// 				// Only append those series for which samples exist as mockSeriesSet
-// 				// doesn't skip series with no samples.
-// 				// TODO: But sometimes SeriesSet returns an empty SeriesIterator
-// 				if len(smpls) > 0 {
-// 					matchedSeries = append(matchedSeries, newSeries(
-// 						m.Map(),
-// 						smpls,
-// 					))
-// 				}
-// 			}
-// 			expSs := newListSeriesSet(matchedSeries)
-
-// 			// Compare both SeriesSets.
-// 			for {
-// 				eok, rok := expSs.Next(), ss.Next()
-
-// 				// Skip a series if iterator is empty.
-// 				if rok {
-// 					for !ss.At().Iterator().Next() {
-// 						rok = ss.Next()
-// 						if !rok {
-// 							break
-// 						}
-// 					}
-// 				}
-// 				testutil.Equals(t, eok, rok, "next")
-
-// 				if !eok {
-// 					break
-// 				}
-// 				sexp := expSs.At()
-// 				sres := ss.At()
-
-// 				testutil.Equals(t, sexp.Labels(), sres.Labels(), "labels")
-
-// 				smplExp, errExp := expandSeriesIterator(sexp.Iterator())
-// 				smplRes, errRes := expandSeriesIterator(sres.Iterator())
-
-// 				testutil.Equals(t, errExp, errRes, "samples error")
-// 				testutil.Equals(t, smplExp, smplRes, "samples")
-// 			}
-// 		}
-// 	}
-
-// 	return
-// }
+	// Add again and test for presence.
+	app = hb.Appender()
+	_, err = app.Add(labels.Labels{{"a", "b"}}, 11, 1)
+	testutil.Ok(t, err)
+	testutil.Ok(t, app.Commit())
+	q, err = NewBlockQuerier(hb, 0, 100000)
+	testutil.Ok(t, err)
+	res, err = q.Select(labels.NewEqualMatcher("a", "b"))
+	testutil.Ok(t, err)
+	testutil.Assert(t, res.Next(), "series don't exist")
+	exps := res.At()
+	it := exps.Iterator()
+	ressmpls, err := expandSeriesIterator(it)
+	testutil.Ok(t, err)
+	testutil.Equals(t, []sample{{11, 1}}, ressmpls)
+}
+func TestDelete_e2e(t *testing.T) {
+	numDatapoints := 1000
+	numRanges := 1000
+	timeInterval := int64(2)
+	// Create 8 series with 1000 data-points of different ranges, delete and run queries.
+	lbls := [][]labels.Label{
+		{
+			{"a", "b"},
+			{"instance", "localhost:9090"},
+			{"job", "prometheus"},
+		},
+		{
+			{"a", "b"},
+			{"instance", "127.0.0.1:9090"},
+			{"job", "prometheus"},
+		},
+		{
+			{"a", "b"},
+			{"instance", "127.0.0.1:9090"},
+			{"job", "prom-k8s"},
+		},
+		{
+			{"a", "b"},
+			{"instance", "localhost:9090"},
+			{"job", "prom-k8s"},
+		},
+		{
+			{"a", "c"},
+			{"instance", "localhost:9090"},
+			{"job", "prometheus"},
+		},
+		{
+			{"a", "c"},
+			{"instance", "127.0.0.1:9090"},
+			{"job", "prometheus"},
+		},
+		{
+			{"a", "c"},
+			{"instance", "127.0.0.1:9090"},
+			{"job", "prom-k8s"},
+		},
+		{
+			{"a", "c"},
+			{"instance", "localhost:9090"},
+			{"job", "prom-k8s"},
+		},
+	}
+	seriesMap := map[string][]sample{}
+	for _, l := range lbls {
+		seriesMap[labels.New(l...).String()] = []sample{}
+	}
+	dir, _ := ioutil.TempDir("", "test")
+	defer os.RemoveAll(dir)
+	hb, err := NewHead(nil, nil, nil, 100000)
+	testutil.Ok(t, err)
+	app := hb.Appender()
+	for _, l := range lbls {
+		ls := labels.New(l...)
+		series := []sample{}
+		ts := rand.Int63n(300)
+		for i := 0; i < numDatapoints; i++ {
+			v := rand.Float64()
+			_, err := app.Add(ls, ts, v)
+			testutil.Ok(t, err)
+			series = append(series, sample{ts, v})
+			ts += rand.Int63n(timeInterval) + 1
+		}
+		seriesMap[labels.New(l...).String()] = series
+	}
+	testutil.Ok(t, app.Commit())
+	// Delete a time-range from each-selector.
+	dels := []struct {
+		ms     []labels.Matcher
+		drange Intervals
+	}{
+		{
+			ms:     []labels.Matcher{labels.NewEqualMatcher("a", "b")},
+			drange: Intervals{{300, 500}, {600, 670}},
+		},
+		{
+			ms: []labels.Matcher{
+				labels.NewEqualMatcher("a", "b"),
+				labels.NewEqualMatcher("job", "prom-k8s"),
+			},
+			drange: Intervals{{300, 500}, {100, 670}},
+		},
+		{
+			ms: []labels.Matcher{
+				labels.NewEqualMatcher("a", "c"),
+				labels.NewEqualMatcher("instance", "localhost:9090"),
+				labels.NewEqualMatcher("job", "prometheus"),
+			},
+			drange: Intervals{{300, 400}, {100, 6700}},
+		},
+		// TODO: Add Regexp Matchers.
+	}
+	for _, del := range dels {
+		// Reset the deletes everytime.
+		for _, r := range del.drange {
+			testutil.Ok(t, hb.Delete(r.Mint, r.Maxt, del.ms...))
+		}
+		matched := labels.Slice{}
+		for _, ls := range lbls {
+			s := labels.Selector(del.ms)
+			if s.Matches(ls) {
+				matched = append(matched, ls)
+			}
+		}
+		sort.Sort(matched)
+		for i := 0; i < numRanges; i++ {
+			q, err := NewBlockQuerier(hb, 0, 100000)
+			testutil.Ok(t, err)
+			defer q.Close()
+			ss, err := q.Select(del.ms...)
+			testutil.Ok(t, err)
+			// Build the mockSeriesSet.
+			matchedSeries := make([]Series, 0, len(matched))
+			for _, m := range matched {
+				smpls := seriesMap[m.String()]
+				smpls = deletedSamples(smpls, del.drange)
+				// Only append those series for which samples exist as mockSeriesSet
+				// doesn't skip series with no samples.
+				// TODO: But sometimes SeriesSet returns an empty SeriesIterator
+				if len(smpls) > 0 {
+					matchedSeries = append(matchedSeries, newSeries(
+						m.Map(),
+						smpls,
+					))
+				}
+			}
+			expSs := newMockSeriesSet(matchedSeries)
+			// Compare both SeriesSets.
+			for {
+				eok, rok := expSs.Next(), ss.Next()
+				// Skip a series if iterator is empty.
+				if rok {
+					for !ss.At().Iterator().Next() {
+						rok = ss.Next()
+						if !rok {
+							break
+						}
+					}
+				}
+				testutil.Equals(t, eok, rok)
+				if !eok {
+					break
+				}
+				sexp := expSs.At()
+				sres := ss.At()
+				testutil.Equals(t, sexp.Labels(), sres.Labels())
+				smplExp, errExp := expandSeriesIterator(sexp.Iterator())
+				smplRes, errRes := expandSeriesIterator(sres.Iterator())
+				testutil.Equals(t, errExp, errRes)
+				testutil.Equals(t, smplExp, smplRes)
+			}
+		}
+	}
+	return
+}
 
 func boundedSamples(full []sample, mint, maxt int64) []sample {
 	for len(full) > 0 {
@@ -670,7 +700,7 @@ func TestComputeChunkEndTime(t *testing.T) {
 			max:   1000,
 			res:   1000,
 		},
-		// Catch divison by zero for cur == start. Strictly not a possible case.
+		// Catch division by zero for cur == start. Strictly not a possible case.
 		{
 			start: 100,
 			cur:   100,
@@ -729,7 +759,7 @@ func TestMemSeries_append(t *testing.T) {
 
 func TestGCChunkAccess(t *testing.T) {
 	// Put a chunk, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, NopWAL(), 1000)
+	h, err := NewHead(nil, nil, nil, 1000)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -769,7 +799,7 @@ func TestGCChunkAccess(t *testing.T) {
 
 func TestGCSeriesAccess(t *testing.T) {
 	// Put a series, select it. GC it and then access it.
-	h, err := NewHead(nil, nil, NopWAL(), 1000)
+	h, err := NewHead(nil, nil, nil, 1000)
 	testutil.Ok(t, err)
 	defer h.Close()
 
@@ -807,4 +837,86 @@ func TestGCSeriesAccess(t *testing.T) {
 	testutil.Equals(t, ErrNotFound, err)
 	_, err = cr.Chunk(chunks[1].Ref)
 	testutil.Equals(t, ErrNotFound, err)
+}
+
+func TestUncommittedSamplesNotLostOnTruncate(t *testing.T) {
+	h, err := NewHead(nil, nil, nil, 1000)
+	testutil.Ok(t, err)
+	defer h.Close()
+
+	h.initTime(0)
+
+	app := h.appender()
+	lset := labels.FromStrings("a", "1")
+	_, err = app.Add(lset, 2100, 1)
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, h.Truncate(2000))
+	testutil.Assert(t, nil != h.series.getByHash(lset.Hash(), lset), "series should not have been garbage collected")
+
+	testutil.Ok(t, app.Commit())
+
+	q, err := NewBlockQuerier(h, 1500, 2500)
+	testutil.Ok(t, err)
+	defer q.Close()
+
+	ss, err := q.Select(labels.NewEqualMatcher("a", "1"))
+	testutil.Ok(t, err)
+
+	testutil.Equals(t, true, ss.Next())
+}
+
+func TestRemoveSeriesAfterRollbackAndTruncate(t *testing.T) {
+	h, err := NewHead(nil, nil, nil, 1000)
+	testutil.Ok(t, err)
+	defer h.Close()
+
+	h.initTime(0)
+
+	app := h.appender()
+	lset := labels.FromStrings("a", "1")
+	_, err = app.Add(lset, 2100, 1)
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, h.Truncate(2000))
+	testutil.Assert(t, nil != h.series.getByHash(lset.Hash(), lset), "series should not have been garbage collected")
+
+	testutil.Ok(t, app.Rollback())
+
+	q, err := NewBlockQuerier(h, 1500, 2500)
+	testutil.Ok(t, err)
+	defer q.Close()
+
+	ss, err := q.Select(labels.NewEqualMatcher("a", "1"))
+	testutil.Ok(t, err)
+
+	testutil.Equals(t, false, ss.Next())
+
+	// Truncate again, this time the series should be deleted
+	testutil.Ok(t, h.Truncate(2050))
+	testutil.Equals(t, (*memSeries)(nil), h.series.getByHash(lset.Hash(), lset))
+}
+
+func TestHead_LogRollback(t *testing.T) {
+	dir, err := ioutil.TempDir("", "wal_rollback")
+	testutil.Ok(t, err)
+	defer os.RemoveAll(dir)
+
+	w, err := wal.New(nil, nil, dir)
+	testutil.Ok(t, err)
+	h, err := NewHead(nil, nil, w, 1000)
+	testutil.Ok(t, err)
+
+	app := h.Appender()
+	_, err = app.Add(labels.FromStrings("a", "b"), 1, 2)
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, app.Rollback())
+	recs := readTestWAL(t, w.Dir())
+
+	testutil.Equals(t, 1, len(recs))
+
+	series, ok := recs[0].([]RefSeries)
+	testutil.Assert(t, ok, "expected series record but got %+v", recs[0])
+	testutil.Equals(t, []RefSeries{{Ref: 1, Labels: labels.FromStrings("a", "b")}}, series)
 }

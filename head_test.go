@@ -17,6 +17,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path"
 	"sort"
 	"testing"
 
@@ -296,57 +297,73 @@ func TestHeadDeleteSimple(t *testing.T) {
 	numSamples := int64(10)
 
 	cases := []struct {
-		intervals   Intervals
-		remaint     []int64
-		remaSampbuf []int64 // sampleBuf after delete.
+		dranges       Intervals
+		remaint       []int64
+		remainSampbuf []int64 // Sample buffer that should remain after deletion.
 	}{
 		{
-			intervals:   Intervals{{0, 3}},
-			remaint:     []int64{4, 5, 6, 7, 8, 9},
-			remaSampbuf: []int64{6, 7, 8, 9},
+			dranges:       Intervals{{0, 3}},
+			remaint:       []int64{4, 5, 6, 7, 8, 9},
+			remainSampbuf: []int64{6, 7, 8, 9},
 		},
 		{
-			intervals:   Intervals{{1, 3}},
-			remaint:     []int64{0, 4, 5, 6, 7, 8, 9},
-			remaSampbuf: []int64{6, 7, 8, 9},
+			dranges:       Intervals{{1, 3}},
+			remaint:       []int64{0, 4, 5, 6, 7, 8, 9},
+			remainSampbuf: []int64{6, 7, 8, 9},
 		},
 		{
-			intervals:   Intervals{{1, 3}, {4, 7}},
-			remaint:     []int64{0, 8, 9},
-			remaSampbuf: []int64{0, 8, 9},
+			dranges:       Intervals{{1, 3}, {4, 7}},
+			remaint:       []int64{0, 8, 9},
+			remainSampbuf: []int64{0, 8, 9},
 		},
 		{
-			intervals:   Intervals{{1, 3}, {4, 700}},
-			remaint:     []int64{0},
-			remaSampbuf: []int64{0},
+			dranges:       Intervals{{1, 3}, {4, 700}},
+			remaint:       []int64{0},
+			remainSampbuf: []int64{0},
 		},
 		{ // This case is for checking if labels and symbols are deleted.
-			intervals:   Intervals{{0, 9}},
-			remaint:     []int64{},
-			remaSampbuf: []int64{},
+			dranges:       Intervals{{0, 9}},
+			remaint:       []int64{},
+			remainSampbuf: []int64{},
 		},
 	}
 
 Outer:
 	for _, c := range cases {
+		dir, err := ioutil.TempDir("", "test_wal_reload")
+		testutil.Ok(t, err)
+		defer os.RemoveAll(dir)
+
+		w, err := wal.New(nil, nil, path.Join(dir, "wal"))
+		testutil.Ok(t, err)
+
 		// Samples are deleted from head after calling head.Delete()
 		// and not just creating tombstones.
 		// Hence creating new Head for every case.
-		head, err := NewHead(nil, nil, nil, 1000)
+		head, err := NewHead(nil, nil, w, 1000)
 		testutil.Ok(t, err)
 
 		app := head.Appender()
 		smpls := make([]float64, numSamples)
 		for i := int64(0); i < numSamples; i++ {
 			smpls[i] = rand.Float64()
-			app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
+			_, err = app.Add(labels.Labels{{"a", "b"}}, i, smpls[i])
+			testutil.Ok(t, err)
 		}
 		testutil.Ok(t, app.Commit())
 
 		// Delete the ranges.
-		for _, r := range c.intervals {
+		for _, r := range c.dranges {
 			testutil.Ok(t, head.Delete(r.Mint, r.Maxt, labels.NewEqualMatcher("a", "b")))
 		}
+
+		reloadedW, err := wal.New(nil, nil, w.Dir())
+		testutil.Ok(t, err)
+		reloadedHead, err := NewHead(nil, nil, reloadedW, 1000)
+		// Test the head reloaded from the WAL to ensure deleted samples
+		// are gone even after reloading the wal file.
+		testutil.Ok(t, err)
+		testutil.Ok(t, reloadedHead.Init())
 
 		/// Checking samples.
 		// Expected samples.
@@ -355,93 +372,100 @@ Outer:
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
 		}
 
-		// Collect all samples from head.
-		actSamples := make([]sample, 0, len(c.remaint))
-		for _, ss := range head.series.series {
-			for _, ms := range ss {
-				for _, chk := range ms.chunks {
-					ii := chk.chunk.Iterator()
-					for ii.Next() {
-						t, v := ii.At()
-						actSamples = append(actSamples, sample{t: t, v: v})
+		// Compare the samples for both heads - before and after the reload.
+		for _, h := range []*Head{head, reloadedHead} {
+			// Collect all samples from head.
+			actSamples := make([]sample, 0, len(c.remaint))
+			for _, ss := range h.series.series {
+				for _, ms := range ss {
+					for _, chk := range ms.chunks {
+						ii := chk.chunk.Iterator()
+						for ii.Next() {
+							t, v := ii.At()
+							actSamples = append(actSamples, sample{t: t, v: v})
+						}
 					}
 				}
 			}
+			testutil.Equals(t, expSamples, actSamples)
 		}
-
-		testutil.Equals(t, expSamples, actSamples)
 
 		/// Checking samples in sampleBuf.
 		/// In this test, there is only 1 series, hence single sampleBuf.
 
 		// Expected samples in sampleBuf.
 		var expSampleBuf [4]sample
-		rem := 4 - len(c.remaSampbuf)
-		for i, ts := range c.remaSampbuf {
+		rem := 4 - len(c.remainSampbuf)
+		for i, ts := range c.remainSampbuf {
 			expSampleBuf[i+rem] = sample{ts, smpls[ts]}
 		}
 
-		seriesExists := false
-		// Actual sampleBuf.
-		actSampleBuf := func() [4]sample {
-			for _, msmap := range head.series.series {
-				if len(msmap) > 0 {
-					seriesExists = true
-					for _, ms := range msmap {
-						return ms.sampleBuf
+		// Compare the sample buf for both heads - before and after the reload.
+		for _, h := range []*Head{head, reloadedHead} {
+			seriesExists := false
+			// Actual sampleBuf.
+			actSampleBuf := func() [4]sample {
+				for _, msmap := range h.series.series {
+					if len(msmap) > 0 {
+						seriesExists = true
+						for _, ms := range msmap {
+							return ms.sampleBuf
+						}
 					}
 				}
+				return [4]sample{{0, 0}, {0, 0}, {0, 0}, {0, 0}}
+			}()
+
+			testutil.Equals(t, expSampleBuf, actSampleBuf)
+
+			if len(expSamples) == 0 {
+				testutil.Equals(t, 0, len(h.values))
+				testutil.Equals(t, 0, len(h.symbols))
+				testutil.Assert(t, !seriesExists, "")
 			}
-			return [4]sample{{0, 0}, {0, 0}, {0, 0}, {0, 0}}
-		}()
-
-		testutil.Equals(t, expSampleBuf, actSampleBuf)
-
-		if len(expSamples) == 0 {
-			testutil.Equals(t, 0, len(head.values))
-			testutil.Equals(t, 0, len(head.symbols))
-			testutil.Assert(t, !seriesExists, "")
 		}
-
-		// Compare the query result.
-		q, err := NewBlockQuerier(head, head.MinTime(), head.MaxTime())
-		testutil.Ok(t, err)
-		res, err := q.Select(labels.NewEqualMatcher("a", "b"))
-		testutil.Ok(t, err)
 
 		expSamples = nil
 		for _, ts := range c.remaint {
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
 		}
 
-		expss := newMockSeriesSet([]Series{
+		expSeriesSet := newMockSeriesSet([]Series{
 			newSeries(map[string]string{"a": "b"}, expSamples),
 		})
 
-		if len(expSamples) == 0 {
-			testutil.Assert(t, !res.Next(), "")
-			testutil.Ok(t, head.Close())
-			continue
-		}
+		// Compare the query results for both heads - before and after the reload.
+		for _, h := range []*Head{head, reloadedHead} {
+			q, err := NewBlockQuerier(h, h.MinTime(), h.MaxTime())
+			testutil.Ok(t, err)
+			actSeriesSet, err := q.Select(labels.NewEqualMatcher("a", "b"))
+			testutil.Ok(t, err)
 
-		for {
-			eok, rok := expss.Next(), res.Next()
-			testutil.Equals(t, eok, rok)
-
-			if !eok {
-				testutil.Ok(t, head.Close())
-				continue Outer
+			if len(expSamples) == 0 {
+				testutil.Assert(t, !actSeriesSet.Next(), "")
+				testutil.Ok(t, h.Close())
+				continue
 			}
-			sexp := expss.At()
-			sres := res.At()
 
-			testutil.Equals(t, sexp.Labels(), sres.Labels())
+			for {
+				eok, rok := expSeriesSet.Next(), actSeriesSet.Next()
+				testutil.Equals(t, eok, rok)
 
-			smplExp, errExp := expandSeriesIterator(sexp.Iterator())
-			smplRes, errRes := expandSeriesIterator(sres.Iterator())
+				if !eok {
+					testutil.Ok(t, h.Close())
+					continue Outer
+				}
+				expSeries := expSeriesSet.At()
+				actSeries := actSeriesSet.At()
 
-			testutil.Equals(t, errExp, errRes)
-			testutil.Equals(t, smplExp, smplRes)
+				testutil.Equals(t, expSeries.Labels(), actSeries.Labels())
+
+				smplExp, errExp := expandSeriesIterator(expSeries.Iterator())
+				smplRes, errRes := expandSeriesIterator(actSeries.Iterator())
+
+				testutil.Equals(t, errExp, errRes)
+				testutil.Equals(t, smplExp, smplRes)
+			}
 		}
 	}
 }
@@ -757,6 +781,21 @@ func TestMemSeries_append(t *testing.T) {
 	}
 }
 
+func TestMemSeries_chunkMetas(t *testing.T) {
+	s := newMemSeries(labels.Labels{}, 1, 500)
+
+	for i := 1; i < 10000; i++ {
+		ok, _ := s.append(1001+int64(i), float64(i))
+		testutil.Assert(t, ok, "append failed")
+	}
+	testutil.Assert(t, len(s.chunks) > 1, "Expected more than 1 chunk")
+
+	metas := s.chunksMetas()
+	testutil.Equals(t, len(s.chunks), len(metas))
+	testutil.Equals(t, s.minTime(), metas[0].MinTime)
+	testutil.Equals(t, s.maxTime(), metas[len(metas)-1].MaxTime)
+}
+
 func TestGCChunkAccess(t *testing.T) {
 	// Put a chunk, select it. GC it and then access it.
 	h, err := NewHead(nil, nil, nil, 1000)
@@ -919,4 +958,29 @@ func TestHead_LogRollback(t *testing.T) {
 	series, ok := recs[0].([]RefSeries)
 	testutil.Assert(t, ok, "expected series record but got %+v", recs[0])
 	testutil.Equals(t, []RefSeries{{Ref: 1, Labels: labels.FromStrings("a", "b")}}, series)
+}
+
+func TestMemSeriesReset(t *testing.T) {
+	ms := newMemSeries(labels.FromStrings("a", "b"), rand.Uint64(), rand.Int63())
+	// Expected memSeries after reset is the one obtained when created.
+	exp := *ms
+
+	for i := 0; i <= 10; i++ {
+		ok, _ := ms.append(int64(i), float64(1000*i))
+		testutil.Assert(t, ok, "Add sample failed")
+	}
+	testutil.Equals(t, int64(0), ms.minTime())
+	testutil.Equals(t, int64(10), ms.maxTime())
+
+	testutil.NotEquals(t, exp, *ms)
+	ms.reset()
+	testutil.Equals(t, exp, *ms)
+
+	// Checking append after reset.
+	for i := 3; i <= 6; i++ {
+		ok, _ := ms.append(int64(i), float64(1000*i))
+		testutil.Assert(t, ok, "Add sample failed")
+	}
+	testutil.Equals(t, int64(3), ms.minTime())
+	testutil.Equals(t, int64(6), ms.maxTime())
 }

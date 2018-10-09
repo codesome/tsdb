@@ -14,7 +14,6 @@
 package tsdb
 
 import (
-	"fmt"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -51,7 +50,8 @@ var (
 	// writable time range.
 	ErrOutOfBounds = errors.New("out of bounds")
 
-	// Head doesn't store any tombstones. This is used to return instead.
+	// emptyTombstoneReader is a no-op Tombstone Reader.
+	// This is used by head to satisfy the Tombstones() function call.
 	emptyTombstoneReader = NewMemTombstones()
 )
 
@@ -370,12 +370,13 @@ func (h *Head) loadWAL(r *wal.Reader) error {
 	}
 	wg.Wait()
 
-	// Though we don't store tombstones anymore, we need this when user
-	// is migrating from the version where we used to store tombstones.
 	if err := allStones.Iter(func(ref uint64, dranges Intervals) error {
-		return h.delete(ref, dranges)
+		return h.chunkRewrite(ref, dranges)
 	}); err != nil {
 		return errors.Wrap(r.Err(), "deleting samples from tombstones")
+	}
+	if allStones.Total() > 0 {
+		h.gc()
 	}
 
 	if unknownRefs > 0 {
@@ -752,6 +753,7 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 		return errors.Wrap(err, "select series")
 	}
 
+	var stones []Stone
 	dirty := false
 	for p.Next() {
 		series := h.series.getByID(p.At())
@@ -762,13 +764,24 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 		}
 		// Delete only until the current values and not beyond.
 		t0, t1 = clampInterval(mint, maxt, t0, t1)
-		if err := h.delete(p.At(), Intervals{{t0, t1}}); err != nil {
+		stones = append(stones, Stone{p.At(), Intervals{{t0, t1}}})
+		if err := h.chunkRewrite(p.At(), Intervals{{t0, t1}}); err != nil {
 			return errors.Wrap(err, "delete samples")
 		}
 		dirty = true
 	}
 	if p.Err() != nil {
 		return p.Err()
+	}
+	var enc RecordEncoder
+	if h.wal != nil {
+		// We need to write stones to WAL to mark the deletion,
+		// though we don't store stones in the head.
+		// This will be used to delete the samples while loading the WAL
+		// during any restart.
+		if err := h.wal.Log(enc.Tombstones(stones, nil)); err != nil {
+			return err
+		}
 	}
 	if dirty {
 		h.gc()
@@ -777,73 +790,33 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	return nil
 }
 
-// delete re-writes the chunks which overlaps with deleted ranges
-// and removes the samples in the deleted ranges. Chunks is deleted
-// if no samples are left at the end.
-func (h *Head) delete(ref uint64, dranges Intervals) error {
+// chunkRewrite re-writes the chunks which overlaps with deleted ranges
+// and removes the samples in the deleted ranges.
+// Chunks is deleted if no samples are left at the end.
+func (h *Head) chunkRewrite(ref uint64, dranges Intervals) (err error) {
 	if len(dranges) == 0 {
 		return nil
 	}
 
-	stripeSeriesIndex := ref % stripeSize
-
-	h.series.locks[stripeSeriesIndex].Lock()
-	defer h.series.locks[stripeSeriesIndex].Unlock()
-	ms, ok := h.series.series[stripeSeriesIndex][ref]
-	if !ok {
-		return fmt.Errorf("Mem series not found for reference id %d", ref)
-	}
+	ms := h.series.getByID(ref)
 	ms.Lock()
 	defer ms.Unlock()
-
-	// Deleting samples for intervals in tombstones.
-	var chnksToDel []int
-	for i, chk := range ms.chunks {
-		if !chk.OverlapsClosedInterval(dranges[0].Mint, dranges[len(dranges)-1].Maxt) {
-			continue
-		}
-
-		// Create new chunk by removing deleted samples.
-		newChunk := chunkenc.NewXORChunk()
-		app, err := newChunk.Appender()
-		if err != nil {
-			return err
-		}
-
-		it := &deletedIterator{it: chk.chunk.Iterator(), intervals: dranges}
-		for it.Next() {
-			ts, v := it.At()
-			app.Append(ts, v)
-		}
-
-		if newChunk.NumSamples() > 0 {
-			ms.chunks[i].chunk = newChunk
-		} else { // Empty chunk, not required to store.
-			chnksToDel = append(chnksToDel, i)
-		}
-	}
-	// Deleting empty chunks.
-	for i, idx := range chnksToDel {
-		ms.chunks = append(ms.chunks[:idx-i], ms.chunks[idx-i+1:]...)
+	if len(ms.chunks) == 0 {
+		return nil
 	}
 
-	// Getting the last 4 samples in the last chunk
-	// to update the sampleBuf.
-	var sb [4]sample
-	if len(ms.chunks) > 0 {
-		chk := ms.chunks[len(ms.chunks)-1].chunk
-		nsmpls := chk.NumSamples()
-		it := chk.Iterator()
-		for nsmpls > 4 { // Iterating till last 4 samples.
-			it.Next()
-			nsmpls--
-		}
-		for i := 4 - nsmpls; it.Next(); i++ {
-			ts, v := it.At()
-			sb[i] = sample{t: ts, v: v}
+	metas := ms.chunksMetas()
+	mint, maxt := metas[0].MinTime, metas[len(metas)-1].MaxTime
+	it := newChunkSeriesIterator(metas, dranges, mint, maxt)
+
+	ms.reset()
+	for it.Next() {
+		t, v := it.At()
+		ok, _ := ms.append(t, v)
+		if !ok {
+			level.Warn(h.logger).Log("msg", "failed to add sample during delete")
 		}
 	}
-	ms.sampleBuf = sb
 
 	return nil
 }
@@ -1351,6 +1324,16 @@ type memSeries struct {
 	app chunkenc.Appender // Current appender for the chunk.
 }
 
+func newMemSeries(lset labels.Labels, id uint64, chunkRange int64) *memSeries {
+	s := &memSeries{
+		lset:       lset,
+		ref:        id,
+		chunkRange: chunkRange,
+		nextAt:     math.MinInt64,
+	}
+	return s
+}
+
 func (s *memSeries) minTime() int64 {
 	if len(s.chunks) == 0 {
 		return math.MinInt64
@@ -1386,14 +1369,24 @@ func (s *memSeries) cut(mint int64) *memChunk {
 	return c
 }
 
-func newMemSeries(lset labels.Labels, id uint64, chunkRange int64) *memSeries {
-	s := &memSeries{
-		lset:       lset,
-		ref:        id,
-		chunkRange: chunkRange,
-		nextAt:     math.MinInt64,
+func (s *memSeries) chunksMetas() []chunks.Meta {
+	metas := make([]chunks.Meta, 0, len(s.chunks))
+	for _, chk := range s.chunks {
+		metas = append(metas, chunks.Meta{Chunk: chk.chunk, MinTime: chk.minTime, MaxTime: chk.maxTime})
 	}
-	return s
+	return metas
+}
+
+// reset re-initialises all the variable in the memSeries except 'lset', 'ref',
+// and 'chunkRange', like how it would appear after 'newMemSeries(...)'.
+func (s *memSeries) reset() {
+	s.chunks = nil
+	s.firstChunkID = 0
+	s.nextAt = math.MinInt64
+	s.lastValue = 0
+	s.sampleBuf = [4]sample{}
+	s.pendingCommit = false
+	s.app = nil
 }
 
 // appendable checks whether the given sample is valid for appending to the series.

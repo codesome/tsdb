@@ -78,19 +78,25 @@ type Head struct {
 }
 
 type headMetrics struct {
-	activeAppenders     prometheus.Gauge
-	series              prometheus.Gauge
-	seriesCreated       prometheus.Counter
-	seriesRemoved       prometheus.Counter
-	seriesNotFound      prometheus.Counter
-	chunks              prometheus.Gauge
-	chunksCreated       prometheus.Counter
-	chunksRemoved       prometheus.Counter
-	gcDuration          prometheus.Summary
-	minTime             prometheus.GaugeFunc
-	maxTime             prometheus.GaugeFunc
-	samplesAppended     prometheus.Counter
-	walTruncateDuration prometheus.Summary
+	activeAppenders         prometheus.Gauge
+	series                  prometheus.Gauge
+	seriesCreated           prometheus.Counter
+	seriesRemoved           prometheus.Counter
+	seriesNotFound          prometheus.Counter
+	chunks                  prometheus.Gauge
+	chunksCreated           prometheus.Counter
+	chunksRemoved           prometheus.Counter
+	gcDuration              prometheus.Summary
+	minTime                 prometheus.GaugeFunc
+	maxTime                 prometheus.GaugeFunc
+	samplesAppended         prometheus.Counter
+	walTruncateDuration     prometheus.Summary
+	headTruncateFail        prometheus.Counter
+	headTruncateTotal       prometheus.Counter
+	checkpointDeleteFail    prometheus.Counter
+	checkpointDeleteTotal   prometheus.Counter
+	checkpointCreationFail  prometheus.Counter
+	checkpointCreationTotal prometheus.Counter
 }
 
 func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
@@ -152,6 +158,30 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 		Name: "prometheus_tsdb_head_samples_appended_total",
 		Help: "Total number of appended samples.",
 	})
+	m.headTruncateFail = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_head_truncations_failed_total",
+		Help: "Total number of head truncations that failed.",
+	})
+	m.headTruncateTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_head_truncations_total",
+		Help: "Total number of head truncations attempted.",
+	})
+	m.checkpointDeleteFail = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_checkpoint_deletions_failed_total",
+		Help: "Total number of checkpoint deletions that failed.",
+	})
+	m.checkpointDeleteTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_checkpoint_deletions_total",
+		Help: "Total number of checkpoint deletions attempted.",
+	})
+	m.checkpointCreationFail = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_checkpoint_creations_failed_total",
+		Help: "Total number of checkpoint creations that failed.",
+	})
+	m.checkpointCreationTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "prometheus_tsdb_checkpoint_creations_total",
+		Help: "Total number of checkpoint creations attempted.",
+	})
 
 	if r != nil {
 		r.MustRegister(
@@ -168,6 +198,12 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 			m.gcDuration,
 			m.walTruncateDuration,
 			m.samplesAppended,
+			m.headTruncateFail,
+			m.headTruncateTotal,
+			m.checkpointDeleteFail,
+			m.checkpointDeleteTotal,
+			m.checkpointCreationFail,
+			m.checkpointCreationTotal,
 		)
 	}
 	return m
@@ -394,12 +430,12 @@ func (h *Head) Init() error {
 	}
 
 	// Backfill the checkpoint first if it exists.
-	cp, n, err := LastCheckpoint(h.wal.Dir())
+	dir, startFrom, err := LastCheckpoint(h.wal.Dir())
 	if err != nil && err != ErrNotFound {
 		return errors.Wrap(err, "find last checkpoint")
 	}
 	if err == nil {
-		sr, err := wal.NewSegmentsReader(filepath.Join(h.wal.Dir(), cp))
+		sr, err := wal.NewSegmentsReader(filepath.Join(h.wal.Dir(), dir))
 		if err != nil {
 			return errors.Wrap(err, "open checkpoint")
 		}
@@ -410,11 +446,11 @@ func (h *Head) Init() error {
 		if err := h.loadWAL(wal.NewReader(sr)); err != nil {
 			return errors.Wrap(err, "backfill checkpoint")
 		}
-		n++
+		startFrom++
 	}
 
 	// Backfill segments from the last checkpoint onwards
-	sr, err := wal.NewSegmentsRangeReader(h.wal.Dir(), n, -1)
+	sr, err := wal.NewSegmentsRangeReader(h.wal.Dir(), startFrom, -1)
 	if err != nil {
 		return errors.Wrap(err, "open WAL segments")
 	}
@@ -433,7 +469,12 @@ func (h *Head) Init() error {
 }
 
 // Truncate removes old data before mint from the head.
-func (h *Head) Truncate(mint int64) error {
+func (h *Head) Truncate(mint int64) (err error) {
+	defer func() {
+		if err != nil {
+			h.metrics.headTruncateFail.Inc()
+		}
+	}()
 	initialize := h.MinTime() == math.MaxInt64
 
 	if h.MinTime() >= mint && !initialize {
@@ -452,6 +493,7 @@ func (h *Head) Truncate(mint int64) error {
 		return nil
 	}
 
+	h.metrics.headTruncateTotal.Inc()
 	start := time.Now()
 
 	h.gc()
@@ -463,31 +505,47 @@ func (h *Head) Truncate(mint int64) error {
 	}
 	start = time.Now()
 
-	m, n, err := h.wal.Segments()
+	first, last, err := h.wal.Segments()
 	if err != nil {
 		return errors.Wrap(err, "get segment range")
 	}
-	n-- // Never consider last segment for checkpoint.
-	if n < 0 {
+	last-- // Never consider last segment for checkpoint.
+	if last < 0 {
 		return nil // no segments yet.
 	}
 	// The lower third of segments should contain mostly obsolete samples.
 	// If we have less than three segments, it's not worth checkpointing yet.
-	n = m + (n-m)/3
-	if n <= m {
+	last = first + (last-first)/3
+	if last <= first {
 		return nil
 	}
 
 	keep := func(id uint64) bool {
 		return h.series.getByID(id) != nil
 	}
-	if _, err = Checkpoint(h.logger, h.wal, m, n, keep, mint); err != nil {
+	h.metrics.checkpointCreationTotal.Inc()
+	if _, err = Checkpoint(h.wal, first, last, keep, mint); err != nil {
+		h.metrics.checkpointCreationFail.Inc()
 		return errors.Wrap(err, "create checkpoint")
+	}
+	if err := h.wal.Truncate(last + 1); err != nil {
+		// If truncating fails, we'll just try again at the next checkpoint.
+		// Leftover segments will just be ignored in the future if there's a checkpoint
+		// that supersedes them.
+		level.Error(h.logger).Log("msg", "truncating segments failed", "err", err)
+	}
+	h.metrics.checkpointDeleteTotal.Inc()
+	if err := DeleteCheckpoints(h.wal.Dir(), last); err != nil {
+		// Leftover old checkpoints do not cause problems down the line beyond
+		// occupying disk space.
+		// They will just be ignored since a higher checkpoint exists.
+		level.Error(h.logger).Log("msg", "delete old checkpoints", "err", err)
+		h.metrics.checkpointDeleteFail.Inc()
 	}
 	h.metrics.walTruncateDuration.Observe(time.Since(start).Seconds())
 
 	level.Info(h.logger).Log("msg", "WAL checkpoint complete",
-		"low", m, "high", n, "duration", time.Since(start))
+		"first", first, "last", last, "duration", time.Since(start))
 
 	return nil
 }
@@ -1006,14 +1064,13 @@ func (h *headIndexReader) LabelValues(names ...string) (index.StringTuples, erro
 	if len(names) != 1 {
 		return nil, errInvalidSize
 	}
-	var sl []string
 
 	h.head.symMtx.RLock()
-	defer h.head.symMtx.RUnlock()
-
+	sl := make([]string, 0, len(h.head.values[names[0]]))
 	for s := range h.head.values[names[0]] {
 		sl = append(sl, s)
 	}
+	h.head.symMtx.RUnlock()
 	sort.Strings(sl)
 
 	return index.NewStringTuples(sl, len(names))
@@ -1305,6 +1362,14 @@ type sample struct {
 	v float64
 }
 
+func (s sample) T() int64 {
+	return s.t
+}
+
+func (s sample) V() float64 {
+	return s.v
+}
+
 // memSeries is the in-memory representation of a series. None of its methods
 // are goroutine safe and it is the caller's responsibility to lock it.
 type memSeries struct {
@@ -1440,6 +1505,9 @@ func (s *memSeries) truncateChunksBefore(mint int64) (removed int) {
 
 // append adds the sample (t, v) to the series.
 func (s *memSeries) append(t int64, v float64) (success, chunkCreated bool) {
+	// Based on Gorilla white papers this offers near-optimal compression ratio
+	// so anything bigger that this has diminishing returns and increases
+	// the time range within which we have to decompress all samples.
 	const samplesPerChunk = 120
 
 	c := s.head()

@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"testing"
 
@@ -30,7 +31,7 @@ import (
 )
 
 func BenchmarkCreateSeries(b *testing.B) {
-	lbls, err := labels.ReadLabels("testdata/20kseries.json", b.N)
+	lbls, err := labels.ReadLabels(filepath.Join("testdata", "20kseries.json"), b.N)
 	testutil.Ok(b, err)
 
 	h, err := NewHead(nil, nil, nil, 10000)
@@ -365,8 +366,6 @@ Outer:
 		testutil.Ok(t, err)
 		testutil.Ok(t, reloadedHead.Init())
 
-		/// Checking samples.
-		// Expected samples.
 		expSamples := make([]sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
@@ -425,13 +424,13 @@ Outer:
 			}
 		}
 
-		expSamples = nil
+		expSamplesTemp := make([]Sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
-			expSamples = append(expSamples, sample{ts, smpls[ts]})
+			expSamplesTemp = append(expSamplesTemp, sample{ts, smpls[ts]})
 		}
 
 		expSeriesSet := newMockSeriesSet([]Series{
-			newSeries(map[string]string{"a": "b"}, expSamples),
+			newSeries(map[string]string{"a": "b"}, expSamplesTemp),
 		})
 
 		// Compare the query results for both heads - before and after the reload.
@@ -554,9 +553,9 @@ func TestDelete_e2e(t *testing.T) {
 			{"job", "prom-k8s"},
 		},
 	}
-	seriesMap := map[string][]sample{}
+	seriesMap := map[string][]Sample{}
 	for _, l := range lbls {
-		seriesMap[labels.New(l...).String()] = []sample{}
+		seriesMap[labels.New(l...).String()] = []Sample{}
 	}
 	dir, _ := ioutil.TempDir("", "test")
 	defer os.RemoveAll(dir)
@@ -565,7 +564,7 @@ func TestDelete_e2e(t *testing.T) {
 	app := hb.Appender()
 	for _, l := range lbls {
 		ls := labels.New(l...)
-		series := []sample{}
+		series := []Sample{}
 		ts := rand.Int63n(300)
 		for i := 0; i < numDatapoints; i++ {
 			v := rand.Float64()
@@ -684,12 +683,12 @@ func boundedSamples(full []sample, mint, maxt int64) []sample {
 	return full
 }
 
-func deletedSamples(full []sample, dranges Intervals) []sample {
-	ds := make([]sample, 0, len(full))
+func deletedSamples(full []Sample, dranges Intervals) []Sample {
+	ds := make([]Sample, 0, len(full))
 Outer:
 	for _, s := range full {
 		for _, r := range dranges {
-			if r.inBounds(s.t) {
+			if r.inBounds(s.T()) {
 				continue Outer
 			}
 		}

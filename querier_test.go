@@ -483,7 +483,7 @@ Outer:
 		querier := &blockQuerier{
 			index:      ir,
 			chunks:     cr,
-			tombstones: NewMemTombstones(),
+			tombstones: newMemTombstones(),
 
 			mint: c.mint,
 			maxt: c.maxt,
@@ -756,7 +756,7 @@ func TestBaseChunkSeries(t *testing.T) {
 		bcs := &baseChunkSeries{
 			p:          index.NewListPostings(tc.postings),
 			index:      mi,
-			tombstones: NewMemTombstones(),
+			tombstones: newMemTombstones(),
 		}
 
 		i := 0
@@ -1507,10 +1507,17 @@ func (m mockIndex) Series(ref uint64, lset *labels.Labels, chks *[]chunks.Meta) 
 
 func (m mockIndex) LabelIndices() ([][]string, error) {
 	res := make([][]string, 0, len(m.labelIndex))
-
 	for k := range m.labelIndex {
 		res = append(res, []string{k})
 	}
-
 	return res, nil
+}
+
+func (m mockIndex) LabelNames() ([]string, error) {
+	labelNames := make([]string, 0, len(m.labelIndex))
+	for name := range m.labelIndex {
+		labelNames = append(labelNames, name)
+	}
+	sort.Strings(labelNames)
+	return labelNames, nil
 }

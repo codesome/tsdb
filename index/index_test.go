@@ -140,11 +140,9 @@ func (m mockIndex) Series(ref uint64, lset *labels.Labels, chks *[]chunks.Meta) 
 
 func (m mockIndex) LabelIndices() ([][]string, error) {
 	res := make([][]string, 0, len(m.labelIndex))
-
 	for k := range m.labelIndex {
 		res = append(res, []string{k})
 	}
-
 	return res, nil
 }
 
@@ -322,10 +320,12 @@ func TestPersistence_index_e2e(t *testing.T) {
 	testutil.Ok(t, err)
 	mi.WritePostings("", "", newListPostings(all))
 
-	for l := range postings.m {
-		err = iw.WritePostings(l.Name, l.Value, postings.Get(l.Name, l.Value))
-		testutil.Ok(t, err)
-		mi.WritePostings(l.Name, l.Value, postings.Get(l.Name, l.Value))
+	for n, e := range postings.m {
+		for v := range e {
+			err = iw.WritePostings(n, v, postings.Get(n, v))
+			testutil.Ok(t, err)
+			mi.WritePostings(n, v, postings.Get(n, v))
+		}
 	}
 
 	err = iw.Close()

@@ -322,7 +322,7 @@ func TestHeadDeleteSimple(t *testing.T) {
 			remaint:       []int64{0},
 			remainSampbuf: []int64{0},
 		},
-		{ // This case is for checking if labels and symbols are deleted.
+		{ // This case is to ensure that labels and symbols are deleted.
 			dranges:       Intervals{{0, 9}},
 			remaint:       []int64{},
 			remainSampbuf: []int64{},
@@ -364,7 +364,7 @@ Outer:
 		// Test the head reloaded from the WAL to ensure deleted samples
 		// are gone even after reloading the wal file.
 		testutil.Ok(t, err)
-		testutil.Ok(t, reloadedHead.Init())
+		testutil.Ok(t, reloadedHead.Init(0))
 
 		expSamples := make([]sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {

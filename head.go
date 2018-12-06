@@ -438,9 +438,6 @@ func (h *Head) loadWAL(r *wal.Reader) error {
 	}); err != nil {
 		return errors.Wrap(r.Err(), "deleting samples from tombstones")
 	}
-	if allStones.Total() > 0 {
-		h.gc()
-	}
 
 	if unknownRefs > 0 {
 		level.Warn(h.logger).Log("msg", "unknown series references", "count", unknownRefs)
@@ -877,10 +874,9 @@ func (h *Head) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	}
 	var enc RecordEncoder
 	if h.wal != nil {
-		// We need to write stones to WAL to mark the deletion,
-		// though we don't store stones in the head.
-		// This will be used to delete the samples while loading the WAL
-		// during any restart.
+		// Although we don't store the stones in the head
+		// we need to write them  to the WAL to mark these as deleted
+		// after a restart while loeading the WAL.
 		if err := h.wal.Log(enc.Tombstones(stones, nil)); err != nil {
 			return err
 		}

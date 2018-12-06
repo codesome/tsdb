@@ -322,7 +322,7 @@ func TestHeadDeleteSimple(t *testing.T) {
 			remaint:       []int64{0},
 			remainSampbuf: []int64{0},
 		},
-		{ // This case is for checking if labels and symbols are deleted.
+		{ // This case is to ensure that labels and symbols are deleted.
 			dranges:       Intervals{{0, 9}},
 			remaint:       []int64{},
 			remainSampbuf: []int64{},

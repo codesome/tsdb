@@ -84,5 +84,4 @@ func formatMessage(msgAndArgs []interface{}) string {
 		return fmt.Sprintf("\n\nmsg: "+msg, msgAndArgs[1:]...)
 	}
 	return ""
-
 }

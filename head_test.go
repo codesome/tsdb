@@ -417,10 +417,26 @@ Outer:
 
 			testutil.Equals(t, expSampleBuf, actSampleBuf)
 
+			ir, err := h.Index()
+			testutil.Ok(t, err)
+			lns, err := ir.LabelNames()
+			testutil.Ok(t, err)
+			lvs, err := ir.LabelValues("a")
+			testutil.Ok(t, err)
 			if len(expSamples) == 0 {
-				testutil.Equals(t, 0, len(h.values))
-				testutil.Equals(t, 0, len(h.symbols))
+				testutil.Equals(t, 0, len(lns))
+				testutil.Equals(t, 0, lvs.Len())
 				testutil.Assert(t, !seriesExists, "")
+			} else {
+				testutil.Equals(t, 1, len(lns))
+				testutil.Equals(t, "a", lns[0])
+
+				testutil.Equals(t, 1, lvs.Len())
+				lv, err := lvs.At(0)
+				testutil.Ok(t, err)
+				testutil.Equals(t, "b", lv[0])
+
+				testutil.Assert(t, seriesExists, "")
 			}
 		}
 
@@ -941,95 +957,6 @@ func TestHead_LogRollback(t *testing.T) {
 	series, ok := recs[0].([]RefSeries)
 	testutil.Assert(t, ok, "expected series record but got %+v", recs[0])
 	testutil.Equals(t, []RefSeries{{Ref: 1, Labels: labels.FromStrings("a", "b")}}, series)
-}
-
-func TestMemSeriesReset(t *testing.T) {
-	ms := newMemSeries(labels.FromStrings("a", "b"), rand.Uint64(), rand.Int63())
-	// Expected memSeries after reset is the one obtained when created.
-	exp := *ms
-
-	for i := 0; i <= 10; i++ {
-		ok, _ := ms.append(int64(i), float64(1000*i))
-		testutil.Assert(t, ok, "Add sample failed")
-	}
-	testutil.Equals(t, int64(0), ms.minTime())
-	testutil.Equals(t, int64(10), ms.maxTime())
-
-	testutil.NotEquals(t, exp, *ms)
-	ms.reset()
-	testutil.Equals(t, exp, *ms)
-
-	// Checking append after reset.
-	for i := 3; i <= 6; i++ {
-		ok, _ := ms.append(int64(i), float64(1000*i))
-		testutil.Assert(t, ok, "Add sample failed")
-	}
-	testutil.Equals(t, int64(3), ms.minTime())
-	testutil.Equals(t, int64(6), ms.maxTime())
-}
-
-func TestQuerierAfterMemSeriesReset(t *testing.T) {
-	h, err := NewHead(nil, nil, nil, 1000)
-	testutil.Ok(t, err)
-	defer h.Close()
-
-	h.initTime(0)
-
-	// Adding some samples before resetting memSeries.
-	app := h.appender()
-	lset := labels.FromStrings("a", "b")
-	for i := 0; i < 100; i++ {
-		_, err = app.Add(lset, int64(i), float64(i))
-		testutil.Ok(t, err)
-	}
-	testutil.Ok(t, app.Commit())
-
-	// Resetting all memSeries.
-	for _, m := range h.series.series {
-		for _, ms := range m {
-			ms.reset()
-		}
-	}
-
-	// Adding new samples.
-	var expSamples []Sample
-	app = h.appender()
-	for i := 101; i < 200; i++ {
-		_, err = app.Add(lset, int64(i), float64(i))
-		testutil.Ok(t, err)
-		expSamples = append(expSamples, sample{int64(i), float64(i)})
-	}
-	testutil.Ok(t, app.Commit())
-	expSeriesSet := newMockSeriesSet([]Series{
-		newSeries(map[string]string{"a": "b"}, expSamples),
-	})
-
-	q, err := NewBlockQuerier(h, math.MinInt64, math.MaxInt64)
-	testutil.Ok(t, err)
-	defer q.Close()
-
-	actSeriesSet, err := q.Select(labels.NewEqualMatcher("a", "b"))
-	testutil.Ok(t, err)
-
-	for {
-		eok, rok := expSeriesSet.Next(), actSeriesSet.Next()
-		testutil.Equals(t, eok, rok)
-
-		if !eok {
-			testutil.Ok(t, h.Close())
-			return
-		}
-		expSeries := expSeriesSet.At()
-		actSeries := actSeriesSet.At()
-
-		testutil.Equals(t, expSeries.Labels(), actSeries.Labels())
-
-		smplExp, errExp := expandSeriesIterator(expSeries.Iterator())
-		smplRes, errRes := expandSeriesIterator(actSeries.Iterator())
-
-		testutil.Equals(t, errExp, errRes)
-		testutil.Equals(t, smplExp, smplRes)
-	}
 }
 
 func TestWalRepair(t *testing.T) {

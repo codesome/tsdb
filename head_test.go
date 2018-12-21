@@ -417,26 +417,8 @@ Outer:
 
 			testutil.Equals(t, expSampleBuf, actSampleBuf)
 
-			ir, err := h.Index()
-			testutil.Ok(t, err)
-			lns, err := ir.LabelNames()
-			testutil.Ok(t, err)
-			lvs, err := ir.LabelValues("a")
-			testutil.Ok(t, err)
 			if len(expSamples) == 0 {
-				testutil.Equals(t, 0, len(lns))
-				testutil.Equals(t, 0, lvs.Len())
 				testutil.Assert(t, !seriesExists, "")
-			} else {
-				testutil.Equals(t, 1, len(lns))
-				testutil.Equals(t, "a", lns[0])
-
-				testutil.Equals(t, 1, lvs.Len())
-				lv, err := lvs.At(0)
-				testutil.Ok(t, err)
-				testutil.Equals(t, "b", lv[0])
-
-				testutil.Assert(t, seriesExists, "")
 			}
 		}
 
@@ -456,10 +438,21 @@ Outer:
 			actSeriesSet, err := q.Select(labels.NewEqualMatcher("a", "b"))
 			testutil.Ok(t, err)
 
+			lns, err := q.LabelNames()
+			testutil.Ok(t, err)
+			lvs, err := q.LabelValues("a")
+			testutil.Ok(t, err)
 			if len(expSamples) == 0 {
-				testutil.Assert(t, !actSeriesSet.Next(), "")
+				testutil.Equals(t, 0, len(lns))
+				testutil.Equals(t, 0, len(lvs))
+				testutil.Assert(t, actSeriesSet.Next() == false, "")
 				testutil.Ok(t, h.Close())
 				continue
+			} else {
+				testutil.Equals(t, 1, len(lns))
+				testutil.Equals(t, 1, len(lvs))
+				testutil.Equals(t, "a", lns[0])
+				testutil.Equals(t, "b", lvs[0])
 			}
 
 			for {

@@ -373,19 +373,35 @@ Outer:
 
 		// Compare the samples for both heads - before and after the reload.
 		for _, h := range []*Head{head, reloadedHead} {
-			// Collect all samples from head.
+			indexr, err := h.Index()
+			testutil.Ok(t, err)
+			// We use emptyTombstoneReader explicitly to get all the samples.
+			css, err := LookupChunkSeries(indexr, emptyTombstoneReader, labels.NewEqualMatcher("a", "b"))
+			testutil.Ok(t, err)
+
+			// Getting the actual samples.
 			actSamples := make([]sample, 0, len(c.remaint))
-			for _, ss := range h.series.series {
-				for _, ms := range ss {
-					for _, chk := range ms.chunks {
-						ii := chk.chunk.Iterator()
-						for ii.Next() {
-							t, v := ii.At()
-							actSamples = append(actSamples, sample{t: t, v: v})
-						}
+			if len(expSamples) > 0 {
+				testutil.Assert(t, css.Next() == true, "")
+				lbls, chkMetas, intv := css.At()
+				testutil.Equals(t, labels.Labels{{"a", "b"}}, lbls)
+				testutil.Equals(t, 0, len(intv))
+
+				chunkr, err := h.Chunks()
+				testutil.Ok(t, err)
+				for _, meta := range chkMetas {
+					chk, err := chunkr.Chunk(meta.Ref)
+					testutil.Ok(t, err)
+					ii := chk.Iterator()
+					for ii.Next() {
+						t, v := ii.At()
+						actSamples = append(actSamples, sample{t: t, v: v})
 					}
 				}
 			}
+
+			testutil.Assert(t, css.Next() == false, "")
+			testutil.Ok(t, css.Err())
 			testutil.Equals(t, expSamples, actSamples)
 		}
 
@@ -393,7 +409,6 @@ Outer:
 		for _, ts := range c.remaint {
 			expSamplesTemp = append(expSamplesTemp, sample{ts, smpls[ts]})
 		}
-
 		expSeriesSet := newMockSeriesSet([]Series{
 			newSeries(map[string]string{"a": "b"}, expSamplesTemp),
 		})

@@ -389,39 +389,6 @@ Outer:
 			testutil.Equals(t, expSamples, actSamples)
 		}
 
-		/// Checking samples in sampleBuf.
-		/// In this test, there is only 1 series, hence single sampleBuf.
-
-		// Expected samples in sampleBuf.
-		var expSampleBuf [4]sample
-		rem := 4 - len(c.remainSampbuf)
-		for i, ts := range c.remainSampbuf {
-			expSampleBuf[i+rem] = sample{ts, smpls[ts]}
-		}
-
-		// Compare the sample buf for both heads - before and after the reload.
-		for _, h := range []*Head{head, reloadedHead} {
-			seriesExists := false
-			// Actual sampleBuf.
-			actSampleBuf := func() [4]sample {
-				for _, msmap := range h.series.series {
-					if len(msmap) > 0 {
-						seriesExists = true
-						for _, ms := range msmap {
-							return ms.sampleBuf
-						}
-					}
-				}
-				return [4]sample{{0, 0}, {0, 0}, {0, 0}, {0, 0}}
-			}()
-
-			testutil.Equals(t, expSampleBuf, actSampleBuf)
-
-			if len(expSamples) == 0 {
-				testutil.Assert(t, !seriesExists, "")
-			}
-		}
-
 		expSamplesTemp := make([]Sample, 0, len(c.remaint))
 		for _, ts := range c.remaint {
 			expSamplesTemp = append(expSamplesTemp, sample{ts, smpls[ts]})

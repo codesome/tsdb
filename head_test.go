@@ -435,7 +435,6 @@ Outer:
 				testutil.Equals(t, eok, rok)
 
 				if !eok {
-					testutil.Assert(t, rok == false, "actual series set include more series than expected")
 					testutil.Ok(t, h.Close())
 					continue Outer
 				}
@@ -458,7 +457,9 @@ func TestDeleteUntilCurMax(t *testing.T) {
 	numSamples := int64(10)
 	hb, err := NewHead(nil, nil, nil, 1000000)
 	testutil.Ok(t, err)
-	defer testutil.Ok(t, hb.Close())
+	defer func() {
+		testutil.Ok(t, hb.Close())
+	}()
 	app := hb.Appender()
 	smpls := make([]float64, numSamples)
 	for i := int64(0); i < numSamples; i++ {
